@@ -22,7 +22,7 @@ log "构建 mlc-core..."
 clang -O2 -Wall -o "$SRC/mlc-core" "$SRC/mlc-core.c" || die "编译失败"
 log "构建完成: $SRC/mlc-core"
 
-log "运行验证套件（21 项：11 静态载荷 + 4 动态链接冒烟 + 6 审计回归）..."
+log "运行验证套件（23 项：11 静态载荷 + 4 动态链接冒烟 + 8 项回归）..."
 bash "$PROJECT_ROOT/tests/verify.sh" || die "验证未通过"
 
 log "=== 安装完成 ==="

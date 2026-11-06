@@ -5,6 +5,8 @@ src/mlc-core-old.c
 src/probe1
 *.o
 tests/test.elf
+tests/regs.elf
+tests/regs.s.o
 tests/.audit*.err
 tests/.trace.err
 .DS_Store

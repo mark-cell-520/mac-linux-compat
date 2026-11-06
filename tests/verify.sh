@@ -18,6 +18,7 @@ if clang -O2 -Wall -o "$SRC/mlc-core" "$SRC/mlc-core.c" 2>/dev/null; then ok "�
 # 1. 构建测试载荷（位置无关 ET_DYN ELF）
 echo "[1] 构建测试载荷"
 python3 "$TESTS/mkelf.py" "$TESTS/test.s" "$TESTS/test.elf" >/dev/null 2>&1 && ok "mkelf 生成" || bad "mkelf 生成"
+python3 "$TESTS/mkelf.py" "$TESTS/regs.s" "$TESTS/regs.elf" >/dev/null 2>&1 && ok "regs 载荷生成" || bad "regs 载荷生成"
 # 目录列举与文件读入的目标用 rootfs 内的自建子目录：
 # 客户机看到的 / 就是 rootfs（v1.2 路径重写语义），不能写真实 /tmp
 GUEST_TMP="$PROJECT_ROOT/rootfs/sysroot/tmp/mlc-dent-test"
@@ -52,9 +53,9 @@ rm -f "$TESTS/.trace.err"
 # 静态载荷证明不了加载器，这里必须跑真二进制
 echo "[4] 动态链接冒烟（rootfs 真实二进制）"
 DYN_OUT=$("$SRC/mlc" ls 2>/dev/null); DRC=$?
-[ $DRC -eq 0 ] && echo "$DYN_OUT" | grep -q "README.md" && ok "mlc ls 跑通动态链接并列出目录" || bad "mlc ls（退出码 $DRC）"
+[ $DRC -eq 0 ] && echo "$DYN_OUT" | grep -q "README.md" && ok "mlc ls 跑通动态链接并列出目录" || bad "mlc ls（退出码 ${DRC}）"
 CAT_OUT=$("$SRC/mlc" cat /etc/hostname 2>/dev/null); CRC=$?
-[ $CRC -eq 0 ] && [ -n "$CAT_OUT" ] && ok "mlc cat 读 rootfs 文件" || bad "mlc cat（退出码 $CRC）"
+[ $CRC -eq 0 ] && [ -n "$CAT_OUT" ] && ok "mlc cat 读 rootfs 文件" || bad "mlc cat（退出码 ${CRC}）"
 "$SRC/mlc" ls /definitely-not-here-xyz >/dev/null 2>&1
 [ $? -eq 2 ] && ok "客户机退出码 2 原样透传" || bad "退出码透传"
 "$SRC/mlc" --list 2>/dev/null | grep -q "^/usr/bin/ls$" && ok "mlc --list 按客户机 PATH 找到程序" || bad "mlc --list"
@@ -76,6 +77,17 @@ REG=$(sed -n 's/.*区域表 \([0-9]*\)\/.*/\1/p' "$TESTS/.audit2.err" | head -1)
 [ -n "$REG" ] && [ "$REG" -lt 512 ] && ok "F42 区域表用量可观测（当前 $REG/512）" || bad "F42 区域表用量不可观测"
 grep -q "cannot apply additional memory protection" "$TESTS/.audit2.err" && bad "F33 RELRO 回归" || ok "F33 RELRO 收尾仍正常"
 rm -f "$TESTS/.audit.err" "$TESTS/.audit2.err"
+
+# 6. 客户机寄存器跨系统调用保存（v5 蹦桌）
+# Linux aarch64 系统调用 ABI 规定除 x0 外所有寄存器原样保留。蹦桌 v4 及以前
+# 漏存 x10-x15、x24-x27、x29，blr 进 C 处理器会踩掉 x10-x15 且不还原，
+# 客户机放在这些寄存器里的活值被抹。regs.elf 把 11 个寄存器填哨兵值后发一次
+# getpid 再逐一比对，任一被改动就以该寄存器编号为退出码失败。
+# 这条断言有牙：把 ML_STUB 里 ldp x10,x11 的还原指令换成 nop，退出码立刻变 10。
+echo "[6] 客户机寄存器跨系统调用保存"
+"$SRC/mlc-core" "$TESTS/regs.elf" >/dev/null 2>&1
+RC=$?
+[ $RC -eq 0 ] && ok "x10-x15/x24-x27/x29 跨系统调用原样保留" || bad "寄存器保存回归（退出码 $RC）"
 
 echo
 echo "=== 结果: 通过 $PASS 项, 失败 $FAIL 项 ==="
