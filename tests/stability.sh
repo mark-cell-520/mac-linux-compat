@@ -29,34 +29,50 @@ WATCHDOG_SECS="${MLC_WATCHDOG_SECS:-20}"
 
 [ -x "$SRC/mlc-core" ] || { echo "先构建：clang -O2 -o src/mlc-core src/mlc-core.c"; exit 1; }
 
-echo "=== MLC 稳定性观测：每个客户机跑 $N 次，崩溃判据是退出码 ${CRASH_CODE}，挂起判据是 ${HANG_CODE}（看门狗 ${WATCHDOG_SECS}s）==="
+# 2026-11-06 第四轮修正：K2 的主要表现形式是「symbol lookup error」，
+# glibc 的 _dl_sym 查找失败走 _exit(127)，**不是** 99 也不是 88。原脚本只数
+# 99 与 88，于是同一时刻 perl 有 65%-73% 在失败，本脚本报 0/480 全绿。
+# 现在把 127 单列成「符号失败」，它是 K2 的签名，与崩溃、挂起并列但不混淆。
+SYMFAIL_CODE=127
+
+echo "=== MLC 稳定性观测：每个客户机跑 $N 次 ==="
+echo "    崩溃判据 ${CRASH_CODE}，挂起判据 ${HANG_CODE}（看门狗 ${WATCHDOG_SECS}s），符号失败判据 ${SYMFAIL_CODE}"
 FAIL_TOTAL=0
 HANG_TOTAL=0
+SYM_TOTAL=0
 RUN_TOTAL=0
-for spec in "ls /nonexistent" "cat /etc/hostname" "sh -c true" "echo hi" "ls -la /" \
-            "sh -c /usr/bin/echo hi" "sh -c /usr/bin/uname -s" "sh -c /usr/bin/id"; do
+# ls -l 覆盖 F64（readlinkat 是桩，含符号链接的目录 ls -l 必失败、退出码 1）
+# perl 是 K2 的探针：实测失败率 25%-73%，是 coreutils 的十倍以上
+for spec in "ls /nonexistent" "cat /etc/hostname" "sh -c true" "echo hi" "ls -l /etc" \
+            "sh -c /usr/bin/echo hi" "sh -c /usr/bin/uname -s" "sh -c /usr/bin/id" \
+            "perl -e print 6*7" "ls -l /usr/bin"; do
     set -- $spec
     prog="$1"; shift
-    bad=0; hung=0
+    bad=0; hung=0; sym=0
     for i in $(seq 1 "$N"); do
         MLC_WATCHDOG="$WATCHDOG_SECS" "$SRC/mlc-core" \
             "$PROJECT_ROOT/rootfs/sysroot/usr/bin/$prog" "$@" >/dev/null 2>&1
         rc=$?
         [ $rc -eq "$CRASH_CODE" ] && bad=$((bad+1))
         [ $rc -eq "$HANG_CODE" ] && hung=$((hung+1))
+        [ $rc -eq "$SYMFAIL_CODE" ] && sym=$((sym+1))
     done
-    printf "  %-26s 崩溃 %d/%d，挂起 %d/%d\n" "$prog $*" "$bad" "$N" "$hung" "$N"
+    printf "  %-26s 崩溃 %d/%d，挂起 %d/%d，符号失败 %d/%d\n" "$prog $*" "$bad" "$N" "$hung" "$N" "$sym" "$N"
     FAIL_TOTAL=$((FAIL_TOTAL + bad))
     HANG_TOTAL=$((HANG_TOTAL + hung))
+    SYM_TOTAL=$((SYM_TOTAL + sym))
     RUN_TOTAL=$((RUN_TOTAL + N))
 done
 
 echo
-echo "合计崩溃 ${FAIL_TOTAL} / ${RUN_TOTAL}，合计挂起 ${HANG_TOTAL} / ${RUN_TOTAL}"
-if [ "$FAIL_TOTAL" -eq 0 ] && [ "$HANG_TOTAL" -eq 0 ]; then
-    echo "本次未观测到偶发崩溃，也未观测到挂起。"
+echo "合计崩溃 ${FAIL_TOTAL} / ${RUN_TOTAL}，合计挂起 ${HANG_TOTAL} / ${RUN_TOTAL}，合计符号失败 ${SYM_TOTAL} / ${RUN_TOTAL}"
+if [ "$FAIL_TOTAL" -eq 0 ] && [ "$HANG_TOTAL" -eq 0 ] && [ "$SYM_TOTAL" -eq 0 ]; then
+    echo "本次未观测到偶发崩溃、挂起与符号失败。"
 else
-    echo "观测到异常。抓一次崩溃现场："
+    echo "观测到异常。抓一次符号失败现场（K2）："
+    echo "  for i in \$(seq 1 400); do ./src/mlc-core rootfs/sysroot/usr/bin/perl -e 'print 6*7' >/dev/null 2>/tmp/f.txt; [ \$? -eq 127 ] && break; done"
+    echo "  grep -E 'undefined symbol|未实现的系统调用' /tmp/f.txt"
+    echo "崩溃现场："
     echo "  for i in \$(seq 1 400); do ./src/mlc-core rootfs/sysroot/usr/bin/sh -c true >/dev/null 2>/tmp/f.txt; [ \$? -ne 99 ] && break; done"
     echo "  grep -E 'TPIDR|信号 |故障地址|TP 存根' /tmp/f.txt"
     echo "挂起现场用看门狗抓（会打出卡住时的 PC 与所在镜像）："

@@ -214,6 +214,47 @@ case "$SUP_OUT" in
 esac
 
 echo
+echo "[11] readlinkat 与 /dev 设备（F64、F65）"
+# F64：readlinkat 原本只认 /proc/self/exe，其余一律 ENOENT，
+# 于是任何含符号链接的目录 ls -l 必失败、退出码 1。判据看两件事：
+# 退出码为 0，且输出里没有 "cannot read symbolic link"。
+for d in /etc / /usr/bin; do
+    OUT=$("$SRC/mlc-core" "$PROJECT_ROOT/rootfs/sysroot/usr/bin/ls" -l "$d" 2>/dev/null)
+    rc=$?
+    nbad=$(printf '%s\n' "$OUT" | grep -c 'cannot read symbolic link')
+    if [ $rc -eq 0 ] && [ "$nbad" -eq 0 ]; then
+        ok "ls -l $d 退出码 0 且无 cannot read symbolic link"
+    else
+        bad "ls -l $d 退出码 $rc，cannot read symbolic link $nbad 处"
+    fi
+done
+# 符号链接的目标名要真的解析出来（/etc 里 rmt 指向 /usr/sbin/rmt）
+if printf '%s\n' "$("$SRC/mlc-core" "$PROJECT_ROOT/rootfs/sysroot/usr/bin/ls" -l /etc 2>/dev/null)" | grep -q 'rmt -> /usr/sbin/rmt'; then
+    ok "符号链接目标被正确解析"
+else
+    bad "符号链接目标没解析出来"
+fi
+# F65：rootfs 原先没有 /dev/urandom 与 /dev/zero，打开一律 ENOENT
+UR=$("$SRC/mlc-core" "$PROJECT_ROOT/rootfs/sysroot/usr/bin/head" -c 16 /dev/urandom 2>/dev/null | wc -c | tr -d ' ')
+if [ "$UR" = "16" ]; then
+    ok "/dev/urandom 能读出 16 字节"
+else
+    bad "/dev/urandom 只读出 ${UR:-0} 字节"
+fi
+ZR=$("$SRC/mlc-core" "$PROJECT_ROOT/rootfs/sysroot/usr/bin/head" -c 32 /dev/zero 2>/dev/null | wc -c | tr -d ' ')
+if [ "$ZR" = "32" ]; then
+    ok "/dev/zero 能读出 32 字节"
+else
+    bad "/dev/zero 只读出 ${ZR:-0} 字节"
+fi
+# dd 会 dup3 再 fstat，覆盖设备 fd 有真后备 fd 那条路
+if "$SRC/mlc-core" "$PROJECT_ROOT/rootfs/sysroot/usr/bin/dd" if=/dev/urandom bs=8 count=1 >/dev/null 2>&1; then
+    ok "dd 从 /dev/urandom 取数成功（dup3 与 fstat 都通）"
+else
+    bad "dd 从 /dev/urandom 取数失败"
+fi
+
+echo
 echo "=== 结果: 通过 $PASS 项, 失败 $FAIL 项 ==="
 if [ $FAIL -ne 0 ]; then
     # 已知缺陷 K2（docs/10）会让个别客户机以约 0.5% 的概率失败：

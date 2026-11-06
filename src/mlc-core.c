@@ -150,6 +150,8 @@
 #define L_ENAMETOOLONG_ 36
 
 // ---------- Linux 打开标志（asm-generic/fcntl.h） ----------
+#define L_O_WRONLY   01
+#define L_O_RDWR     02
 #define L_O_CREAT     0100
 #define L_O_EXCL      0200
 #define L_O_TRUNC    01000
@@ -160,6 +162,10 @@
 
 #define GUEST_FD_MAX 256
 static int g_fd_map[GUEST_FD_MAX];   // 客户机 fd -> 宿主 fd，-1 为空
+// F65：/dev/urandom 与 /dev/zero 没有宿主 fd，用这两个标记记住哪个客户机 fd
+// 是哪个设备，read 时按标记造数据，close 时只摘标记不动宿主 fd。
+static uint8_t g_dev_random[GUEST_FD_MAX];
+static uint8_t g_dev_zero[GUEST_FD_MAX];
 static uint64_t g_brk_start, g_brk_cur;
 // 诊断计数器：看门狗用它们区分"客户机真的没再调用"与"在疯狂调用但 trace 不可信"
 static volatile uint64_t g_sc_total;
@@ -179,6 +185,30 @@ static int guest_fd_host(int gfd) {
     if (gfd < 0 || gfd >= GUEST_FD_MAX) return -1;
     return g_fd_map[gfd];
 }
+
+// F65：判断客户机 fd 是否是 /dev/urandom 一类的虚拟设备
+static int guest_fd_is_dev(int gfd) {
+    return gfd >= 0 && gfd < GUEST_FD_MAX && (g_dev_random[gfd] || g_dev_zero[gfd]);
+}
+
+// F65：打开虚拟设备。用宿主 /dev/null 做后备 fd，这样 dup/fcntl/fstat/lseek
+// 全都自然可用（dd 打开 /dev/urandom 后会 dup3 再 fstat，没有真 fd 就走不下去）；
+// 真正的数据由 SYS_read 按标记现造。两个标记都置上时以 random 优先。
+static int64_t dev_open(int is_random) {
+    int hfd = open("/dev/null", O_RDONLY);
+    if (hfd < 0) return -errno;
+    int gfd = guest_fd_alloc(hfd);
+    if (gfd < 0) { close(hfd); return -L_EMFILE_; }
+    if (is_random) g_dev_random[gfd] = 1; else g_dev_zero[gfd] = 1;
+    return gfd;
+}
+
+// F65：dup 系列要把设备标记一起带过去，否则复制出来的 fd 只剩 /dev/null 的语义
+static void dev_fd_copy(int from, int to) {
+    if (from < 0 || from >= GUEST_FD_MAX || to < 0 || to >= GUEST_FD_MAX) return;
+    g_dev_random[to] = g_dev_random[from];
+    g_dev_zero[to]   = g_dev_zero[from];
+}
 static void guest_fd_free(int gfd) {
     if (gfd >= 0 && gfd < GUEST_FD_MAX) g_fd_map[gfd] = -1;
 }
@@ -191,10 +221,45 @@ static void guest_fd_free(int gfd) {
 typedef struct { uint64_t start, end; } g_region_t;   // 半开区间 [start, end)
 static g_region_t g_region[G_REGION_MAX];
 static int g_region_n = 0;
+static int g_overlap_seen = 0;         // 已报告过区域重叠（只报一次，K2 排查）
 static pthread_mutex_t g_region_lock = PTHREAD_MUTEX_INITIALIZER;   // 为 M3 多线程预留
+
+static void region_check(const char *who) {
+    for (int i = 0; i < g_region_n; i++) {
+        if ((g_region[i].start & 0x3FFFULL) || (g_region[i].end & 0x3FFFULL)) {
+            fprintf(stderr, "[mlc][区域告警] %s 之后区域表出现未对齐条目 [0x%llx,0x%llx)\n",
+                    who, (unsigned long long)g_region[i].start,
+                    (unsigned long long)g_region[i].end);
+            return;
+        }
+    }
+    // 重叠检测：两个已登记区间重叠，说明后一次 MAP_FIXED 把前一次映射的内容
+    // 静默卸掉了（macOS 的 MAP_FIXED 不报错，直接替换）。这类损坏没有症状提示，
+    // 只会让客户机读到别人的数据——K2 的「失败符号每次都不一样」正符合这个特征。
+    for (int i = 0; i < g_region_n && !g_overlap_seen; i++) {
+        for (int j = i + 1; j < g_region_n; j++) {
+            if (g_region[i].start < g_region[j].end && g_region[j].start < g_region[i].end) {
+                fprintf(stderr, "[mlc][重叠告警] %s 之后区域 %d [0x%llx,0x%llx) 与区域 %d [0x%llx,0x%llx) 重叠\n",
+                        who, i, (unsigned long long)g_region[i].start,
+                        (unsigned long long)g_region[i].end,
+                        j, (unsigned long long)g_region[j].start,
+                        (unsigned long long)g_region[j].end);
+                g_overlap_seen = 1;
+                break;
+            }
+        }
+    }
+}
 
 static void region_add(uint64_t s, uint64_t e) {
     if (s >= e) return;
+    // K2 排查：区域表区间必须是宿主页对齐的。未对齐的区间会让 guest_region_overlap
+    // 与 guest_ptr_ok 给出错误答案（登记范围比实际映射偏了一页内的偏移），
+    // 后续 mmap 的落位与野指针校验都会跟着错。这里抓现场。
+    if ((s & 0x3FFFULL) || (e & 0x3FFFULL)) {
+        fprintf(stderr, "[mlc][区域告警] region_add 传入未对齐区间 [0x%llx,0x%llx)\n",
+                (unsigned long long)s, (unsigned long long)e);
+    }
     pthread_mutex_lock(&g_region_lock);
     for (int i = 0; i < g_region_n; i++) {          // 相邻即合并，减少碎片
         if (s <= g_region[i].end && g_region[i].start <= e) {
@@ -211,6 +276,7 @@ static void region_add(uint64_t s, uint64_t e) {
     } else {
         fprintf(stderr, "[mlc] 警告: 客户机区域表已满（%d），后续映射不纳入校验\n", G_REGION_MAX);
     }
+    region_check("region_add");
     pthread_mutex_unlock(&g_region_lock);
 }
 
@@ -240,16 +306,31 @@ static void region_del(uint64_t s, uint64_t e) {
         else         g_region[i].end = s;                          // 删尾部
         i++;
     }
+    region_check("region_del");
     pthread_mutex_unlock(&g_region_lock);
 }
 
-// [s,e) 是否完整落在某个已注册区域内
+// [s,e) 是否被已注册区域完全覆盖（按区间的并集判定，不要求落在同一条目里）。
+// 原实现要求整个 [s,e) 落在单一条目内，而 region_add 只与第一个相交条目合并、
+// 相邻映射经常是两条独立条目，于是跨边界的合法指针被判成非法，引擎返回 -EFAULT。
+// K2（2026-11-06 定位）：ld.so 的符号查找路径上有大量跨映射边界的缓冲，
+// 被误判后系统调用逐个失败，症状就是「undefined symbol」而失败符号每次都不一样。
 static int region_covers(uint64_t s, uint64_t e) {
     if (s >= e) return 0;
     int r = 0;
     pthread_mutex_lock(&g_region_lock);
-    for (int i = 0; i < g_region_n; i++)
-        if (g_region[i].start <= s && e <= g_region[i].end) { r = 1; break; }
+    uint64_t cur = s;
+    for (;;) {
+        uint64_t best = cur;
+        for (int i = 0; i < g_region_n; i++) {
+            // 能接上当前点，且比已知最远端更远——取最远的那个，跳过中间条目
+            if (g_region[i].start <= cur && g_region[i].end > best) best = g_region[i].end;
+        }
+        if (best == cur) break;          // 没有区域能继续延伸，中间有洞
+        cur = best;
+        if (cur >= e) break;
+    }
+    r = (cur >= e);
     pthread_mutex_unlock(&g_region_lock);
     return r;
 }
@@ -276,19 +357,30 @@ static int guest_ptr_ok(uint64_t p, uint64_t len) {
     return region_covers(p, p + len);
 }
 
-// 客户机字符串校验：必须在已注册区域内以 NUL 结尾（maxlen 内）
+// 客户机字符串校验：必须在已注册区域内以 NUL 结尾（maxlen 内）。
+// F66（2026-11-06）：原实现只在「p 所在的那一个区域」里找 NUL，字符串一旦跨到
+// 相邻区域就被判成非法指针，系统调用返回 -EFAULT。这与 region_covers 原来的
+// 单条目限制是同一类缺陷——region_add 只与第一个相交条目合并，相邻映射经常是
+// 两条独立条目。改成按区间并集逐段找：当前段没找到 NUL 就跳到下一个能接上的区域。
 static int guest_str_ok(uint64_t p, uint64_t maxlen) {
     if (!p) return 0;
     pthread_mutex_lock(&g_region_lock);
     int ok = 0;
-    for (int i = 0; i < g_region_n && !ok; i++) {
-        if (g_region[i].start <= p && p < g_region[i].end) {
-            uint64_t end = g_region[i].end;
-            uint64_t lim = (p + maxlen < end) ? p + maxlen : end;
-            const char *s = (const char *)p;
-            for (uint64_t k = 0; k < lim - p; k++)
-                if (s[k] == 0) { ok = 1; break; }
-        }
+    uint64_t cur = p;
+    uint64_t limit = p + maxlen;
+    for (;;) {
+        // 找能覆盖 cur 且伸得最远的区域
+        uint64_t best = cur;
+        for (int i = 0; i < g_region_n; i++)
+            if (g_region[i].start <= cur && g_region[i].end > best) best = g_region[i].end;
+        if (best == cur) break;                       // 没有区域能接上，中间是洞
+        uint64_t seg_end = (best < limit) ? best : limit;
+        const char *s = (const char *)(uintptr_t)cur;
+        for (uint64_t k = 0; k < seg_end - cur; k++)
+            if (s[k] == 0) { ok = 1; break; }
+        if (ok) break;
+        if (seg_end >= limit) break;                  // 已经找满 maxlen 还没 NUL
+        cur = seg_end;
     }
     pthread_mutex_unlock(&g_region_lock);
     return ok;
@@ -417,6 +509,7 @@ static uint64_t g_tp_last_write = 0;    // TP 存根最后一次真正写进 TPI
 static int g_tp_writes = 0;             // TP 存根被进入的次数
 static uint64_t g_tp_last_restored = 0; // 蹦桌最后一次 msr 回客户机的值（K1 排查）
 static uint64_t g_sc_last_nr = 0;       // 最后一次系统调用号（K1 排查）
+static int g_patch_skipped = 0;        // 补丁因 B 射程超限被跳过的站点数（K2 排查）
 
 static int64_t mlc_syscall_handler(uint64_t *regs);
 static int64_t mlc_tp_write_probe(uint64_t *regs, int n);
@@ -562,6 +655,17 @@ static int64_t sys_openat(int gdirfd, const char *path, uint64_t lflags, uint64_
     // v1：仅支持 AT_FDCWD(-100) 与绝对/相对路径
     if (!guest_str_ok((uint64_t)path, 4096)) return -L_EFAULT;
     if (gdirfd != -100 && path[0] != '/') return -L_EBADF;   // AT_FDCWD=-100
+    // F65（2026-11-06 实测）：rootfs 里没有 /dev/urandom、/dev/random、/dev/zero，
+    // 客户机打开一律 ENOENT。glibc 的 malloc 播种、getrandom 回退、以及任何要
+    // 熵源的脚本都会走到这里。宿主的 arc4random 是真随机，直接用它，不落盘。
+    // /dev/null 走下面的普通路径（rootfs 里已有一个空文件，读写都成功）。
+    if (strcmp(path, "/dev/urandom") == 0 || strcmp(path, "/dev/random") == 0) {
+        if (lflags & (L_O_WRONLY | L_O_RDWR)) return -L_EACCES;   // 随机源只读
+        return dev_open(1);
+    }
+    if (strcmp(path, "/dev/zero") == 0) {
+        return dev_open(0);
+    }
     char hpath[1024];
     if (guest_to_host_path(path, hpath, sizeof(hpath)) < 0) return -L_ENAMETOOLONG_;
     int flags = 0;
@@ -699,6 +803,12 @@ static void compat_window_init(void) {
 // 主程序放低端、interp 放高端，ld.so 往下分配时落在窗口空白区（v1.2 修）。
 static uint64_t win_alloc(uint64_t len) {
     if (len == 0 || (uint64_t)(g_win_low + len) > (uint64_t)g_win_high) return 0;
+    // K2 排查：游标必须是宿主页对齐的。未对齐的游标会让 mmap 的 MAP_FIXED 落点
+    // 比引擎簿记的地址低最多一页，而返回给客户机的却是 page_down 之后的地址，
+    // 客户机据此算出的 l_addr 与后续 MAP_FIXED 全部偏掉，两个库可能叠在一起。
+    if ((uint64_t)g_win_low & 0x3FFFULL)
+        fprintf(stderr, "[mlc][窗口告警] win_alloc 游标未对齐 0x%llx（len=0x%llx）\n",
+                (unsigned long long)(uintptr_t)g_win_low, (unsigned long long)len);
     uint64_t r = (uint64_t)g_win_low;
     g_win_low += len;
     return r;
@@ -725,7 +835,12 @@ static void win_free_top(uint64_t s, uint64_t e) {
             if (cand < re && rs < low) { cand = re; changed = 1; }
         }
     }
-    if (cand < low) g_win_low = (uint8_t *)cand;
+    if (cand < low) {
+        if (cand & 0x3FFFULL)
+            fprintf(stderr, "[mlc][窗口告警] win_free_top 要把游标退到未对齐地址 0x%llx\n",
+                    (unsigned long long)cand);
+        g_win_low = (uint8_t *)cand;
+    }
 }
 // 蹦桌池分配（len 已对齐）；失败返回 0
 static uint64_t tp_alloc(uint64_t len) {
@@ -841,6 +956,7 @@ static void guest_state_reset(void) {
     g_tp_last_write = 0;
     g_tp_last_restored = 0;
     g_sc_last_nr = 0;
+    g_patch_skipped = 0;
     g_sc_total = 0;
     for (int i = 0; i < 512; i++) g_sc_by_nr[i] = 0;   // volatile 数组不能用 memset
     // 窗口游标回到两端，新镜像从低端重新 bump-up
@@ -859,6 +975,9 @@ static void guest_state_reset(void) {
 static int64_t mlc_tp_write_probe(uint64_t *regs, int n) {
     g_tp_writes++;
     uint64_t v = regs[n];
+    if (getenv("MLC_DEBUG"))
+        fprintf(stderr, "[mlc][tp-write] 客户机要写 TPIDR_EL0 = 0x%llx（当前有效 TCB 0x%llx）\n",
+                (unsigned long long)v, (unsigned long long)g_guest_tp_good);
     if (v >= TP_PLAUSIBLE_MIN) {
         g_guest_tp_good = v;
         g_tp_last_write = v;
@@ -942,7 +1061,14 @@ static int patch_svc_in_range(uint8_t *content, size_t nbytes) {
         int64_t to_stub = (int64_t)stub - (int64_t)&w[j];
         int64_t to_ret  = (int64_t)(&w[j] + 1) - (int64_t)(stub + (nwords_stub - 1) * 4);
         if (to_stub > 0x08000000LL || to_stub < -0x08000000LL ||
-            to_ret  > 0x08000000LL || to_ret  < -0x08000000LL) continue;
+            to_ret  > 0x08000000LL || to_ret  < -0x08000000LL) {
+            // K2 排查：射程不够就放弃这个站点。被放弃的 svc 会触发 SIGSYS，
+            // 被放弃的 mrs TPIDR_EL0 会让客户机读到 macOS 遗留的野线程指针。
+            // 窗口 96MB 加蹦桌池 16MB 的极限距离约 112MB，离 128MB 只剩 16MB 余量，
+            // 而窗口基址每轮都变，所以这是少数几个真会随运行变化的因素。
+            g_patch_skipped++;
+            continue;
+        }
         w[j] = 0x14000000u | ((uint32_t)(to_stub / 4) & 0x03FFFFFFu);
         uint32_t *bret = (uint32_t *)(stub + (nwords_stub - 1) * 4);
         bret[0] = 0x14000000u | ((uint32_t)(to_ret / 4) & 0x03FFFFFFu);
@@ -1034,6 +1160,17 @@ static int64_t sys_mmap_impl(uint64_t addr, uint64_t len, uint64_t prot, uint64_
         if (hfd >= 0 && len > 0) {
             ssize_t got = pread(hfd, (void *)(rbase + off_in_page), (size_t)len, (off_t)off);
             if (got < 0) { munmap((void *)rbase, map_len); return -errno; }
+            // K2 排查：短读不会报错，但映射尾部会停在零页。glibc 的动态链接元数据
+            // 就在文件前部，一旦没读全，符号表整段是零，查表必然失败，而症状是
+            // 「undefined symbol」且失败符号每次都不一样——与 K2 完全吻合。
+            // 原实现只判 got < 0，短读被静默放过。
+            // 短读在这里是正常的：客户机会按 memsz 请求比 filesz 更大的映射，
+            // 多出来的部分本就该是零页（匿名映射已是零），所以只在 MLC_DEBUG 下提示。
+            if (got != (ssize_t)len && getenv("MLC_DEBUG")) {
+                fprintf(stderr, "[mlc][短读] fd=%d 文件偏移 0x%llx 请求 %zu 字节，实读 %zd 字节"
+                        "（多出的部分按零页处理）\n", hfd, (unsigned long long)off,
+                        (size_t)len, got);
+            }
         }
         // 扫 svc 并修补（内容已在内存里）
         if (hprot & PROT_EXEC) {
@@ -1155,6 +1292,18 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         }
     }
     case SYS_read: {
+        // F65：设备 fd 必须先判，它们没有宿主 fd（表里是 -1 占位），
+        // 走到下面 guest_fd_host 的 EBADF 分支就再也读不到了
+        if ((int)a0 >= 0 && (int)a0 < GUEST_FD_MAX && g_dev_random[(int)a0]) {
+            if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+            arc4random_buf((void *)a1, (size_t)a2);
+            return (int64_t)a2;
+        }
+        if ((int)a0 >= 0 && (int)a0 < GUEST_FD_MAX && g_dev_zero[(int)a0]) {
+            if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+            memset((void *)a1, 0, (size_t)a2);
+            return (int64_t)a2;
+        }
         int hfd = guest_fd_host((int)a0);
         if (hfd < 0) return -L_EBADF;
         if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
@@ -1195,7 +1344,15 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     case SYS_openat:
         return sys_openat((int)a0, (const char *)a1, a2, a3);
     case SYS_close: {
-        int gfd = (int)a0, hfd = guest_fd_host(gfd);
+        int gfd = (int)a0;
+        // F65：设备 fd 没有宿主 fd，先摘标记再返回，不能走 close(hfd)
+        if (gfd >= 0 && gfd < GUEST_FD_MAX && (g_dev_random[gfd] || g_dev_zero[gfd])) {
+            g_dev_random[gfd] = 0;
+            g_dev_zero[gfd] = 0;
+            guest_fd_free(gfd);
+            return 0;
+        }
+        int hfd = guest_fd_host(gfd);
         if (hfd < 0) return -L_EBADF;
         // M2：目录句柄联动销毁，避免 DIR* 与内部 dup fd 泄漏
         pthread_mutex_lock(&g_dir_lock);
@@ -1208,15 +1365,25 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         return 0;
     }
     case SYS_lseek: {
+        // F65：设备 fd 不可 seek，报 0 让调用方以为停在开头
+        if (guest_fd_is_dev((int)a0)) return 0;
         int hfd = guest_fd_host((int)a0);
         if (hfd < 0) return -L_EBADF;
         off_t r = lseek(hfd, (off_t)a1, (int)a2);
         return r < 0 ? -errno : r;
     }
     case SYS_fstat: {
+        if (!guest_ptr_ok(a1, sizeof(l_stat_t))) return -L_EFAULT;
+        // F65：设备 fd 没有宿主 fd，报成字符设备（S_IFCHR=0o020000，size 0）
+        if (guest_fd_is_dev((int)a0)) {
+            memset((void *)a1, 0, sizeof(l_stat_t));
+            l_stat_t *ls = (l_stat_t *)a1;
+            ls->st_mode = 0020000 | 020666;
+            ls->st_blksize = 4096;
+            return 0;
+        }
         int hfd = guest_fd_host((int)a0);
         if (hfd < 0) return -L_EBADF;
-        if (!guest_ptr_ok(a1, sizeof(l_stat_t))) return -L_EFAULT;
         struct stat hs;
         if (fstat(hfd, &hs) < 0) return -errno;
         fill_lstat((l_stat_t *)a1, &hs);
@@ -1320,6 +1487,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         if (is_dup) {
             int g = guest_fd_alloc(r);
             if (g < 0) { close(r); return -L_EMFILE_; }
+            dev_fd_copy((int)a0, g);
             return g;
         }
         return r;
@@ -1357,8 +1525,14 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         // 复制留下的，除了多打一行诊断没有任何作用。
         if (engine_region_hit(page_down(s), page_up(e))) return -L_EINVAL;
         uint64_t wl_before = (uint64_t)g_win_low;
+        // 区域表与宿主实际卸除的范围必须一致：宿主只卸 [page_up(s), page_down(e))
+        // （页内残余不能动，见上方 F31 注释），所以区域表也只摘这一段。
+        // 曾直接把未对齐的 [s, e) 交给 region_del，它的「删中间」与「删头部」
+        // 分支会写出未对齐条目（实测形如 [0x10a5c4018,0x10a5c8000)），
+        // 之后 region_add 的合并、win_free_top 的游标回退都建立在对齐假设上。
+        uint64_t d_s = page_up(s), d_e = page_down(e);
         // 先从区域表摘掉，win_free_top 才能看出哪一段真的空了（顺序反了会永远退不动）
-        region_del(s, e);
+        if (d_s < d_e) region_del(d_s, d_e);
         win_free_top(page_down(s), page_up(e));   // 窗口栈式复用
         uint64_t mid_s = page_up(s), mid_e = page_down(e);
         if (mid_s < mid_e && munmap((void *)mid_s, mid_e - mid_s) < 0) return -errno;
@@ -1425,7 +1599,9 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         int nd = dup(hfd);
         if (nd < 0) return -errno;
         int g = guest_fd_alloc(nd);
-        return g < 0 ? -L_EMFILE_ : g;
+        if (g < 0) { close(nd); return -L_EMFILE_; }
+        dev_fd_copy((int)a0, g);
+        return g;
     }
     case SYS_dup3: {
         int hfd = guest_fd_host((int)a0);
@@ -1444,12 +1620,41 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         pthread_mutex_unlock(&g_dir_lock);
         if (d) closedir(d);
         g_fd_map[a1] = nd;
+        dev_fd_copy((int)a0, (int)a1);
         return (int64_t)a1;
     }
     case SYS_exit:
     case SYS_exit_group: {
         // 这里必须自己打 trace：wrapper 的返回打印排在 _exit 之后，永远不会执行
         if (getenv("MLC_DEBUG")) {
+            // K2 排查：失败发生在客户机代码里，看不到调用链就定位不到是哪一段。
+            // x30 是链接寄存器，_dl_signal_error 系列的调用者会留在栈上，
+            // 这里把退出瞬间的全部寄存器打出来，事后按镜像基址反查符号。
+            fprintf(stderr, "[mlc][退出现场] x29=0x%llx x30=0x%llx pc 附近 sp=0x%llx\n",
+                    (unsigned long long)regs[29], (unsigned long long)regs[30],
+                    (unsigned long long)(uintptr_t)&regs[0]);
+            // 反查这些地址各落在哪个客户机区域，直接指出失败发生在哪一段代码里
+            uint64_t probes[8];
+            int np = 0;
+            probes[np++] = regs[30];
+            uint64_t *sp0 = (uint64_t *)regs[31];
+            if (sp0 && guest_ptr_ok((uint64_t)(uintptr_t)sp0, 128)) {
+                for (int k = 0; k < 6 && np < 8; k++) probes[np++] = sp0[k];
+            }
+            for (int k = 0; k < np; k++) {
+                uint64_t a = probes[k];
+                if (!a) continue;
+                int hit = -1;
+                for (int i = 0; i < g_region_n; i++)
+                    if (g_region[i].start <= a && a < g_region[i].end) { hit = i; break; }
+                fprintf(stderr, "[mlc][退出现场] 地址 0x%llx 落在%s\n",
+                        (unsigned long long)a,
+                        hit < 0 ? "任何已注册区域之外" : "");
+                if (hit >= 0)
+                    fprintf(stderr, "[mlc][退发现场]   区域 %d [0x%llx,0x%llx)\n", hit,
+                            (unsigned long long)g_region[hit].start,
+                            (unsigned long long)g_region[hit].end);
+            }
             fprintf(stderr, "[mlc] 系统调用 nr=%llu -> 进程退出码 %d\n",
                     (unsigned long long)nr, (int)a0);
             // 退出前直接读各库加载点：libc 的 _IO_2_1_stdout_ 在基址 + 0x1b1520，
@@ -1468,7 +1673,69 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
             fprintf(stderr, "[mlc][诊断] TP 存根进入 %d 次，最后写入 0x%llx，有效 TCB 0x%llx，野值顶替 %d 次\n",
                     g_tp_writes, (unsigned long long)g_tp_last_write,
                     (unsigned long long)g_guest_tp_good, g_tp_fixups);
+            fprintf(stderr, "[mlc][诊断] 补丁射程超限跳过 %d 处\n", g_patch_skipped);
+            // K2 排查：客户机 TCB 若落在未登记区域，所有 TLS 访问（errno、栈保护值、
+            // 指针保护值、DTV）都会被 guest_ptr_ok 判成非法指针，系统调用返回 -EFAULT，
+            // glibc 内部状态随之错乱。TCB 落在哪里取决于客户机把 TLS 块映射到哪，
+            // 而那是逐轮变化的。
+            if (g_guest_tp_good) {
+                int tpok = region_covers(g_guest_tp_good, g_guest_tp_good + 0x800);
+                fprintf(stderr, "[mlc][诊断] 有效 TCB 0x%llx 及其后 2KB %s\n",
+                        (unsigned long long)g_guest_tp_good,
+                        tpok ? "在已登记区域内" : "不在已登记区域内（TLS 访问会被误判）");
+            }
+            // K2 探针：把每个镜像的动态链接元数据区（.gnu.hash 到 .rela.plt 末尾）
+            // 从客户机内存原样 dump 出来，与 ELF 文件原文逐字节比对。
+            // 之所以需要它：K2 的失败符号每次都不一样（calloc / crypt_r / _res /
+            // _dl_argv / __libc_single_threaded），说明坏的是查表机制而不是某个符号，
+            // 而查表机制的数据全在这段里。比对结果直接回答"内存里的表有没有被改"。
         }
+                    const char *dd = getenv("MLC_DUMP_DIR");
+            if (dd) {
+                // 先把引擎自己登记的镜像 dump 一遍
+                for (int i = 0; i < g_nimg; i++) {
+                    image_t *m = &g_img[i];
+                    Elf64_Ehdr *eh = (Elf64_Ehdr *)m->img;
+                    if (!eh || memcmp(eh->e_ident, "\177ELF", 4) != 0) continue;
+                    Elf64_Phdr *ph = (Elf64_Phdr *)(m->img + eh->e_phoff);
+                    for (int k = 0; k < eh->e_phnum; k++) {
+                        if (ph[k].p_type != PT_LOAD) continue;
+                        if (!(ph[k].p_flags & 1)) continue;          // 只要可执行段
+                        uint64_t lo = ph[k].p_vaddr, hi = lo + ph[k].p_filesz;
+                        // 元数据节的文件区间：从 0x200 扫到可执行段末，覆盖
+                        // .gnu.hash/.dynsym/.dynstr/.gnu.version*/.rela.*
+                        uint64_t s = lo + 0x200, e = hi;
+                        if (s >= e) continue;
+                        char op[512];
+                        const char *bn = strrchr(m->name, '/');
+                        bn = bn ? bn + 1 : m->name;
+                        snprintf(op, sizeof(op), "%s/%s.bin", dd, bn);
+                        FILE *fo = fopen(op, "wb");
+                        if (!fo) continue;
+                        fwrite((void *)(uintptr_t)(m->mem + s), 1, (size_t)(e - s), fo);
+                        fclose(fo);
+                        fprintf(stderr, "[mlc][转储] %s 元数据 0x%llx-0x%llx -> %s\n",
+                                bn, (unsigned long long)s, (unsigned long long)e, op);
+                    }
+                }
+                // 再扫区域表：libc 一类库是 ld.so 自己 mmap 进来的，引擎没有登记成
+                // 镜像，只在区域表里。全量 dump，事后再按 ELF 头定位各个库的表。
+                // 之所以不能只 dump 以 ELF 开头的区间：客户机 munmap 掉预留区头部
+                // 之后，region_add 的相邻合并会把区间起点并回到预留区基址，
+                // 于是"区间起点"并不等于 ELF 头，按 \7fELF 过滤会漏掉真正的库。
+                for (int i = 0; i < g_region_n; i++) {
+                    uint64_t rs = g_region[i].start, re = g_region[i].end;
+                    if (re <= rs) continue;
+                    char op[512];
+                    snprintf(op, sizeof(op), "%s/reg%02d.bin", dd, i);
+                    FILE *fo = fopen(op, "wb");
+                    if (!fo) continue;
+                    fwrite((void *)(uintptr_t)rs, 1, (size_t)(re - rs), fo);
+                    fclose(fo);
+                    fprintf(stderr, "[mlc][转储] 区域 %d [0x%llx,0x%llx) -> %s\n",
+                            i, (unsigned long long)rs, (unsigned long long)re, op);
+                }
+            }
         fflush(NULL);
         // CLONE_CHILD_CLEARTID：退出前把 child_tidptr 清成 0（Linux 内核语义）。
         // 只在与当初记下的值一致时才写，避免清掉别人后来写进去的东西。
@@ -1650,12 +1917,30 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         // v1.2：ld.so 与 libc 会读 /proc/self/exe 找自身路径，返回客户机看到的可执行路径
         if (!guest_str_ok(a1, 4096)) return -L_EFAULT;
         const char *lp = (const char *)a1;
-        if (strcmp(lp, "/proc/self/exe") != 0) return -L_ENOENT;   // 其余 /proc 链接不提供
-        if (!guest_ptr_ok(a2, a3)) return -L_EFAULT;
-        size_t n = strlen(g_execfn) + 1;
-        if (n > a3) n = a3;
-        memcpy((void *)a2, g_execfn, n);
-        return (int64_t)n;
+        if (strcmp(lp, "/proc/self/exe") == 0) {
+            if (!guest_ptr_ok(a2, a3)) return -L_EFAULT;
+            size_t n = strlen(g_execfn) + 1;
+            if (n > a3) n = a3;
+            memcpy((void *)a2, g_execfn, n);
+            return (int64_t)n;
+        }
+        // F64（2026-11-06 实测，100% 复现）：原实现把 /proc/self/exe 以外的路径一律
+        // 返回 ENOENT，于是任何含符号链接的目录 ls -l 全线失败、退出码 1
+        // （/etc 2 处、/ 3 处、/usr/bin 23 处，与符号链接数严格相等）。
+        // 改成翻译成宿主路径后调宿主 readlinkat，结果抄回客户机缓冲区。
+        // Linux readlinkat 不补 NUL，返回值就是写进 buf 的字节数，这里照做。
+        if (a3 > 65536) return -L_EINVAL;
+        if (a3 && !guest_ptr_ok(a2, a3)) return -L_EFAULT;
+        char hpath[1024];
+        if (guest_to_host_path(lp, hpath, sizeof(hpath)) < 0) return -L_ENAMETOOLONG_;
+        char *tmp = (char *)malloc(a3 ? (size_t)a3 : 1);
+        if (!tmp) return -L_ENOMEM;
+        int hdir = (a0 == (uint64_t)-100) ? AT_FDCWD : guest_fd_host((int)a0);
+        ssize_t r = readlinkat(hdir, hpath, tmp, (size_t)a3);
+        if (r < 0) { int e = errno; free(tmp); return -e; }
+        memcpy((void *)a2, tmp, (size_t)r);
+        free(tmp);
+        return (int64_t)r;
     }
     case SYS_nanosleep:
     case SYS_clock_nanosleep: {
@@ -2065,6 +2350,13 @@ static int64_t mlc_syscall_handler(uint64_t *regs) {
     }
     static int trace = -1;
     if (trace < 0) trace = getenv("MLC_DEBUG") ? 1 : 0;
+    // K2 排查：MLC_DEBUG=1 时 perl 的符号查找失败率从约五成降到 0，而 MLC_DEBUG
+    // 只控制打印。这里用一个纯粹消耗 CPU 的探针验证「是不是时序」：
+    // 若 MLC_SLOW 也能把失败率打到 0，说明失败由时序决定，与打印内容无关。
+    if (getenv("MLC_SLOW")) {
+        volatile uint64_t acc = 0;
+        for (int k = 0; k < 20000; k++) acc += (uint64_t)k * 2654435761u;
+    }
     int64_t r = mlc_syscall_handler_impl(regs);
     // K1 排查：regs[REG_TPIDR] 此刻就是蹦桌出口 msr tpidr_el0 将要写回的值。
     // 崩溃时把它与现场读到的 TPIDR_EL0 对比：相等说明翻野发生在最后一次系统调用
@@ -2080,11 +2372,24 @@ static int64_t mlc_syscall_handler(uint64_t *regs) {
         fprintf(stderr, "[mlc][tp-out] nr=%llu 宿主调用后 TPIDR_EL0=0x%llx\n",
                 (unsigned long long)regs[REG_X8], (unsigned long long)now);
     }
-    if (trace)
+    if (trace) {
         fprintf(stderr, "[mlc] 系统调用 nr=%llu x0=%llx x1=%llx x2=%llx -> %llx\n",
                 (unsigned long long)regs[REG_X8], (unsigned long long)regs[0],
                 (unsigned long long)regs[1], (unsigned long long)regs[2],
                 (unsigned long long)(uint64_t)r);
+        // K2 排查用：openat/newfstatat/readlinkat 的路径参数是客户机指针，
+        // 只看 x1 的数值认不出加载的是哪个库，补一条翻译后的宿主路径。
+        uint64_t nr2 = regs[REG_X8];
+        if (nr2 == 56 || nr2 == 79 || nr2 == 78) {
+            const char *gp = (const char *)(uintptr_t)regs[1];
+            if (guest_str_ok((uint64_t)(uintptr_t)gp, 4096)) {
+                char hp[1024];
+                if (guest_to_host_path(gp, hp, sizeof(hp)) == 0)
+                    fprintf(stderr, "[mlc][路径] nr=%llu %s\n",
+                            (unsigned long long)nr2, hp);
+            }
+        }
+    }
     return r;
 }
 
