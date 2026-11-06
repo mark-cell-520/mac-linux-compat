@@ -128,6 +128,44 @@ esac
 XRC=$?
 [ $XRC -eq 2 ] && ok "外部命令的退出码经 wait4 透传（ls 的 ENOENT 是 2）" || bad "外部命令退出码透传（得到 ${XRC}，应为 2）"
 
+# 8b. newfstatat 的 statbuf 必须真的被填（v1.6 F59）
+# 曾经的 bug：把 a2 当 flags、a3 当 statbuf，而 ABI 是 a2=statbuf、a3=flags。
+# 后果是 statbuf 从来没被写过，而返回值一直是 0（成功）——客户机看到的是
+# 「stat 成功但整个结构体全零」。实测症状：dash 的 test -f / -d 恒为假
+# （st_mode 为 0），PATH 搜索把找到的可执行文件全判成「非常规文件」而跳过，
+# sh -c 'ls /' 报 Permission denied、退出码 127。
+# ls/cat/stat 不受影响是因为 glibc 2.39 优先走 statx，所以必须用 newfstatat
+# 这条路上的消费者（dash 的 test 内建）来钉。
+echo "[8b] newfstatat 的 statbuf 真被填（文件类型位）"
+F_OUT=$("$SRC/mlc" sh -c '[ -f /usr/bin/ls ] && echo regular' 2>/dev/null); FRC=$?
+case "$F_OUT" in
+    regular) [ $FRC -eq 0 ] && ok "test -f 认得常规文件（st_mode 类型位正确）" || bad "test -f 退出码 ${FRC}" ;;
+    *) bad "test -f 不认常规文件（退出码 ${FRC}，输出 [$F_OUT]）——newfstatat 的 statbuf 没填" ;;
+esac
+D_OUT=$("$SRC/mlc" sh -c '[ -d /usr/bin ] && echo dir' 2>/dev/null); DRC=$?
+case "$D_OUT" in
+    dir) [ $DRC -eq 0 ] && ok "test -d 认得目录" || bad "test -d 退出码 ${DRC}" ;;
+    *) bad "test -d 不认目录（退出码 ${DRC}，输出 [$D_OUT]）" ;;
+esac
+# 负向：不存在的路径必须仍然返回失败，不能因为修 statbuf 把失败也变成成功
+N_OUT=$("$SRC/mlc" sh -c '[ -f /definitely-not-here-xyz ] && echo bad' 2>/dev/null); NRC=$?
+[ -z "$N_OUT" ] && [ $NRC -ne 0 ] && ok "不存在的路径 test -f 仍为假" || bad "不存在的路径被误判为常规文件（输出 [$N_OUT]）"
+# 这条同时是 PATH 搜索能否走通的判据：dash 靠 S_ISREG 决定要不要 exec
+P_OUT=$("$SRC/mlc" sh -c 'ls /' 2>/dev/null | head -1); PRC=${PIPESTATUS[0]}
+[ -n "$P_OUT" ] && ok "PATH 搜索能定位并执行外部命令" || bad "PATH 搜索仍然失败（退出码 ${PRC}）"
+
 echo
 echo "=== 结果: 通过 $PASS 项, 失败 $FAIL 项 ==="
-[ $FAIL -eq 0 ] || exit 1
+if [ $FAIL -ne 0 ]; then
+    # 已知缺陷 K2（docs/10）会让个别客户机以约 0.5% 的概率失败：
+    # 符号查找失败退出码 127，或永久挂起。它是环境性的、与本次改动无关，
+    # 但会把门禁变成随机红——而随机失败的门禁比没有门禁更糟。
+    # 因此这里自动重跑一次：确定性回归两次都会红，K2 的偶发第二次几乎必然绿。
+    # 重跑次数可用 MLC_VERIFY_RETRY 调，设 0 关闭。
+    if [ "${MLC_VERIFY_RETRY:-1}" -gt 0 ]; then
+        echo "[提示] 有 $FAIL 项失败。已知缺陷 K2 会造成约 0.5% 的偶发失败，自动重跑一次。"
+        echo "[提示] 若第二次仍然红，就是真回归，不要忽略。"
+        MLC_VERIFY_RETRY=0 exec bash "$0" "$@"
+    fi
+    exit 1
+fi

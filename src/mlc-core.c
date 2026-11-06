@@ -1202,19 +1202,29 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         return 0;
     }
     case SYS_newfstatat: {
+        // ABI：newfstatat(int dfd, const char *filename, struct stat *statbuf, int flag)
+        //      a0=dfd  a1=filename  a2=statbuf  a3=flag
+        // 曾把 a2/a3 写反：a2 当 flag、a3 当 statbuf。后果是 statbuf 从来没被填过，
+        // 而客户机看到的返回值一直是 0（成功）——于是 stat 全都「成功但全零」。
+        // 实测症状：dash 的 test -f / -d 恒为假（st_mode 为 0，S_ISREG/S_ISDIR 都不成立），
+        // 进而 dash 的 PATH 搜索把找到的可执行文件全部判成「非常规文件」而跳过，
+        // sh -c 'ls /' 报 Permission denied、退出码 127。
+        // ls/cat/stat 一类不受影响是因为 glibc 2.39 优先走 statx（nr=291），那条路是对的。
         if (!guest_str_ok(a1, 4096)) return -L_EFAULT;
-        if (a3 && !guest_ptr_ok(a3, sizeof(l_stat_t))) return -L_EFAULT;
+        if (a2 && !guest_ptr_ok(a2, sizeof(l_stat_t))) return -L_EFAULT;
         const char *path = (const char *)a1;
         char hpath[1024];
         if (guest_to_host_path(path, hpath, sizeof(hpath)) < 0) return -L_ENAMETOOLONG_;
         struct stat hs;
         int r;
-        // a2 是 flags：AT_SYMLINK_NOFOLLOW(0x100) 时用 lstat
-        int nofollow = (a2 & 0x100) != 0;
-        if (a0 == -100 /*AT_FDCWD*/) r = nofollow ? lstat(hpath, &hs) : stat(hpath, &hs);
-        else r = fstatat(guest_fd_host((int)a0), hpath, &hs, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+        // a3 是 flags：AT_SYMLINK_NOFOLLOW(0x100) 时用 lstat
+        int nofollow = (a3 & 0x100) != 0;
+        if (a0 == (uint64_t)-100 /*AT_FDCWD*/)
+            r = nofollow ? lstat(hpath, &hs) : stat(hpath, &hs);
+        else
+            r = fstatat(guest_fd_host((int)a0), hpath, &hs, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
         if (r < 0) return -errno;
-        if (a3 /* statbuf */) fill_lstat((l_stat_t *)a3, &hs);
+        if (a2 /* statbuf */) fill_lstat((l_stat_t *)a2, &hs);
         return 0;
     }
     case SYS_statx: {

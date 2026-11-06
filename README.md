@@ -10,7 +10,7 @@ macOS 上的 Linux 兼容层。不做虚拟机，用用户态翻译在 macOS ARM
 完整的 ld.so → libc → libselinux → libpcre2 动态链接链、locale/gconv 初始化、
 `statx/newfstatat/lstat` 权限与符号链接、`getdents64` 目录列举、
 客户机退出码原样透传、fork/exec/wait4（外部命令经 sh 执行）。
-已验证约 60 个系统调用；tests/verify.sh 二十八项全过（十一项静态载荷 + 四项动态链接冒烟 + 十项审计回归 + 一项寄存器保存回归 + 一项线程指针回归 + 三项 fork/exec）。
+已验证约 60 个系统调用；tests/verify.sh 三十二项全过（十一项静态载荷 + 四项动态链接冒烟 + 十项审计回归 + 一项寄存器保存回归 + 一项线程指针回归 + 三项 fork/exec + 四项 newfstatat）。
 不能跑：多线程、真实信号投递、网络、非 PIE 镜像
 （见 docs/10-整改清单.md 的 M2/M3 段）。
 已知缺陷：
@@ -48,15 +48,27 @@ docs/10 的 K1 节，这里不重复。v1.6 的五点：
    出来的子进程本就继承了副本），区域表、guard 表、镜像表、brk 区、蹦桌池
    全部重建；环境变量也换成客户机自己给的那份，不再透传宿主 environ。
 
-回归：tests/verify.sh 新增第 [8] 段三项——外部命令真的执行了、argv 真的传对了、
-退出码经 wait4 真的透传了。tests/stability.sh 的观测面扩到 8 个程序，并改用
-引擎自带的 MLC_WATCHDOG 把「永久挂起」单列：macOS 没有 timeout 命令，
-一次挂起就能把观测脚本卡死，v1.6 量化 K2 时正是这么卡住的。
+回归：tests/verify.sh 新增第 [8] 段三项（外部命令真的执行了、argv 真的传对了、
+退出码经 wait4 真的透传了）与第 [8b] 段四项（test -f 认得常规文件、test -d
+认得目录、不存在的路径仍为假、PATH 搜索能定位并执行外部命令）。
+tests/stability.sh 的观测面扩到 8 个程序，并改用引擎自带的 MLC_WATCHDOG 把
+「永久挂起」单列：macOS 没有 timeout 命令，一次挂起就能把观测脚本卡死，
+v1.6 量化 K2 时正是这么卡住的。
+
+顺带修掉一个一直潜伏的严重缺陷 F59：newfstatat 的 a2/a3 写反了。
+Linux 的 ABI 是 `newfstatat(dfd, filename, statbuf, flag)`，即 a2 是 statbuf、
+a3 是 flag；实现里却把 a2 当 flag、a3 当 statbuf。后果是 statbuf 从来没被
+填过，而返回值一直是 0（成功）——客户机看到的是「stat 成功但整个结构体全零」。
+连锁后果比想象的严重：dash 的 PATH 搜索靠 S_ISREG 决定要不要用这个文件，
+st_mode 为 0 时所有找到的可执行文件都被判成「非常规文件」而跳过，
+于是 sh -c 里任何靠 PATH 找的外部命令都跑不了（报 Permission denied、退出码 127）。
+它一直没被发现是因为 glibc 2.39 上的 coreutils 优先走 statx（nr=291），
+而 statx 那条路是对的；只有直接走 newfstatat 的消费者才会踩到。
 
 ## 一键安装
 
 双击 `MLC.command`（Finder 里右键→打开，或直接双击）。
-脚本依次做：检查 arm64 + clang → 解包 rootfs → 构建 src/mlc-core → 跑 28 项验证 →
+脚本依次做：检查 arm64 + clang → 解包 rootfs → 构建 src/mlc-core → 跑 32 项验证 →
 把 `mlc` 命令拷到 `~/.local/bin`。不装 Homebrew、不改系统配置、不留服务。
 卸载：删掉项目目录与 `~/.local/bin/mlc`，无残留。
 
@@ -78,7 +90,7 @@ mlc cat /etc/hostname        # 读 rootfs 里的文件
 mlc --list                   # rootfs 里可运行的程序清单
 mlc sh -c 'echo hi'          # 跑 sh（内建命令）
 mlc sh -c 'ls /'            # 跑 sh 里的外部命令（fork/exec）
-bash tests/verify.sh         # 二十八项验证
+bash tests/verify.sh         # 三十二项验证
 bash tests/stability.sh 200  # 偶发失败率观测（只报告，不作门禁）
 ```
 
@@ -133,7 +145,7 @@ bash tests/stability.sh 200  # 偶发失败率观测（只报告，不作门禁�
 - src/mlc 命令行入口（PATH 查找 + 退出码透传）
 - src/install.sh 手动安装（等价于 MLC.command）
 - scripts/unpack-rootfs.sh 按需解出 103MB 的 sysroot
-- tests/ 测试载荷生成器（mkelf.py 迷你链接器 + test.s + regs.s + tp.s）、验证脚本（28 项）、稳定性观测
+- tests/ 测试载荷生成器（mkelf.py 迷你链接器 + test.s + regs.s + tp.s）、验证脚本（32 项）、稳定性观测
 - rootfs/ubuntu-base-arm64.tar.gz Ubuntu Base 24.04.5 ARM64（29MB，解压后约 103MB）
 - docs/ 十份生命周期文档：调研、准备、计划、执行、验证、审计、安全、修复、落地、整改
 
