@@ -106,6 +106,28 @@ echo "[7] 客户机线程指针跨 msr/mrs 完整"
 RC=$?
 [ $RC -eq 0 ] && ok "msr 记下/顶替、mrs 读回有效 TCB，七种目标寄存器一致" || bad "线程指针回归（退出码 ${RC}）"
 
+# 8. fork/exec（v1.6 B7）：sh 里的外部命令要真的跑起来
+# 以前 clone(CLONE_VM|CLONE_VFORK|SIGCHLD) 返回 ENOSYS，glibc 的 posix_spawn
+# 直接失败，sh -c '任何外部命令' 都跑不了。现在 clone 走 fork()、execve 走
+# longjmp 回加载循环换镜像、wait4 走 waitpid 并翻译状态编码。
+# 两条断言分别盯「命令真的执行了」和「参数真的传进去了」——只测输出为空时
+# 退出码仍可能是 0，那样断言是假的。
+echo "[8] fork/exec：外部命令经 sh 执行"
+EXEC_OUT=$("$SRC/mlc" sh -c '/usr/bin/echo MLC_EXEC_OK' 2>/dev/null); ERC=$?
+case "$EXEC_OUT" in
+    *MLC_EXEC_OK*) [ $ERC -eq 0 ] && ok "sh -c 执行外部命令并拿到输出" || bad "外部命令输出对但退出码 ${ERC}" ;;
+    *) bad "外部命令没跑起来（退出码 ${ERC}，输出 [$EXEC_OUT]）" ;;
+esac
+ARG_OUT=$("$SRC/mlc" sh -c '/usr/bin/uname -s' 2>/dev/null); ARC=$?
+case "$ARG_OUT" in
+    Linux) [ $ARC -eq 0 ] && ok "外部命令的 argv 正确透传" || bad "外部命令 argv 退出码 ${ARC}" ;;
+    *) bad "外部命令 argv 没传对（退出码 ${ARC}，输出 [$ARG_OUT]）" ;;
+esac
+# 退出码透传：子进程非零退出要让 sh 原样交给外层
+"$SRC/mlc" sh -c '/usr/bin/ls /definitely-not-here-xyz' >/dev/null 2>&1
+XRC=$?
+[ $XRC -eq 2 ] && ok "外部命令的退出码经 wait4 透传（ls 的 ENOENT 是 2）" || bad "外部命令退出码透传（得到 ${XRC}，应为 2）"
+
 echo
 echo "=== 结果: 通过 $PASS 项, 失败 $FAIL 项 ==="
 [ $FAIL -eq 0 ] || exit 1

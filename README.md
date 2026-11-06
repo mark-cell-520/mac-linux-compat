@@ -3,57 +3,60 @@
 macOS 上的 Linux 兼容层。不做虚拟机，用用户态翻译在 macOS ARM64 上直接运行 Linux ARM64 程序。
 思路与 CrossOver/Wine 同构：客户机指令原生执行，Linux 系统调用在本进程内翻译成 macOS 调用。
 
-## 现状（2026-11-06，v1.5）
+## 现状（2026-11-06，v1.6）
 
 能跑：Ubuntu Base 24.04.5 ARM64 的真实动态 PIE 可执行文件。
-实测通过：`ls`、`ls -la /`、`cat`、`echo`、`sh -c`（内建命令）、
+实测通过：`ls`、`ls -la /`、`cat`、`echo`、`sh -c`（内建命令与外部命令）、
 完整的 ld.so → libc → libselinux → libpcre2 动态链接链、locale/gconv 初始化、
 `statx/newfstatat/lstat` 权限与符号链接、`getdents64` 目录列举、
-客户机退出码原样透传。
-已验证约 60 个系统调用；tests/verify.sh 二十五项全过（十一项静态载荷 + 四项动态链接冒烟 + 七项审计回归 + 一项寄存器保存回归 + 一项线程指针回归）。
-不能跑：fork/exec（外部命令）、多线程、真实信号投递、网络、非 PIE 镜像
+客户机退出码原样透传、fork/exec/wait4（外部命令经 sh 执行）。
+已验证约 60 个系统调用；tests/verify.sh 二十八项全过（十一项静态载荷 + 四项动态链接冒烟 + 十项审计回归 + 一项寄存器保存回归 + 一项线程指针回归 + 三项 fork/exec）。
+不能跑：多线程、真实信号投递、网络、非 PIE 镜像
 （见 docs/10-整改清单.md 的 M2/M3 段）。
-已知缺陷：动态链接路径的偶发崩溃（缺陷 K1）已在 v1.5 消除——实测 2000 轮
-`sh -c true`、1500 轮 `ls /nonexistent`、1500 轮 `cat /etc/hostname` 全部 0 次崩溃，
-同口径下 v1.4 基线是 43/2000。量化用 `bash tests/stability.sh`。
+已知缺陷：
+· K1（动态链接偶发崩溃）已在 v1.5 消除——实测 8000 轮 0 次崩溃，同口径 v1.4
+  基线是 43/2000。根因仍未定位，属「知其然不知其所以然」。
+· K2（v1.6 量化发现，未解决）：部分客户机偶发符号查找失败与永久挂起。
+  id 约 1.3%、hostname 约 0.7% 的概率以退出码 127 结束
+  （`symbol lookup error: ... undefined symbol: calloc, version GLIBC_2.17`），
+  另有约 0.5% 的概率永久挂起。uname/date/env/pwd/arch/nproc/true/echo/ls/cat/sh
+  各 150 次全干净。与 v1.6 的 fork/exec 无关——v1.5 同口径比例一致，且直接调
+  mlc-core 就复现。量化用 `bash tests/stability.sh`。
 
-v1.5 接着 v1.4 的全量审计往下挖，把缺陷 K1 从「2% 到 7% 偶发崩溃」打到归零：
+v1.6 在 v1.5 的基础上打通 fork/exec（B7），外部命令从此能经 sh 跑起来。
 
-1. 先定位到翻野的区间。崩溃现场打印「蹦桌末次还原」与「系统调用 nr」后确认：
-   蹦桌在最后一次系统调用出口写回的一直是有效 TCB（0x10xxxxf80 一档），
-   而崩溃时 TPIDR_EL0 是 0x1006 一类的小值。也就是说翻野发生在「最后一次
-   系统调用之后、崩溃之前」那段只有客户机代码在跑的区间里。
-2. 排除了客户机自己写野值的可能。全 rootfs 816 个 ELF 静态扫过 msr TPIDR_EL0
-   （编码 0xD51BD040|N），只有 ld.so 两处、ldconfig.real 一处，libc 与所有
-   程序、库一处都没有，且 ld.so 那两处都已修补、运行期只进入其中一处。
-   又给所有可捕获信号装了监听，崩溃运行里一个信号都没到达。
-3. 剩下的可能只有 macOS libSystem。实测它在宿主调用里确实会把 0x0、0x1006、
-   0x1007 一类小值写进 TPIDR_EL0（约二十分之一的调用会这样），但它凭什么在
-   没有宿主调用的间隙里能跑，没有可观测的触发点。
-4. 既然拦不住写，就拦住读。客户机唯一拿到线程指针的入口是 mrs xN, TPIDR_EL0
-   （编码 0xD53BD040|N）。v1.5 新增 19 词的 mrs 拦截存根，读出来跟已知有效
-   TCB 不一致就换成有效 TCB。于是无论 TPIDR_EL0 被谁写野，客户机都看不到，
-   glibc 的 TP 相对访问再也不会落到近零地址。
-5. 顺带解决蹦桌池的一对矛盾：池子既要被引擎反复写，又要被客户机当指令跳，
-   而 macOS 禁止匿名映射同时可写可执行（实测 mprotect 到 RWX 直接 EACCES）。
-   v1.4 及以前按 page_up 把已用范围整段设为只读，F55 之后拦截数上去就爆了。
-   现在改成「写前恢复可写、写后设为只读可执行」的切换，且收尾无条件执行——
-   少了这个无条件，mprotect 补扫那条路会把池子留在可写不可执行状态，
-   ls -la / 崩 199/200（故障页 prot=3，故障指令正是 mrs 存根首条）。
+v1.5 那轮做的是把缺陷 K1 打到归零，做法与证据见 docs/08 的 F55/F56 与
+docs/10 的 K1 节，这里不重复。v1.6 的五点：
 
-回归：tests/tp.elf 端到端钉住这条链（msr 记下有效 TCB、野值被顶替、mrs 读回
-有效 TCB、七种目标寄存器一致、邻存寄存器不被踩、跨系统调用后仍成立）。
-去牙实测：关掉 msr 拦截退出码变 4，把 cbz 分支改回旧下标退出码变 11，
-把 movk 编码少写一位退出码变 99。
+1. clone（nr=220）落到宿主 fork()。客户机只有两种用法：glibc posix_spawn 的
+   CLONE_VM|CLONE_VFORK|SIGCHLD（实测 a0=0x4111）与裸 fork 的 SIGCHLD。
+   其余带 CLONE_THREAD/CLONE_SETTLS 等位的一律返回 ENOSYS——多线程归 M3，
+   不给语义不符的成功。CLONE_VM 的「共享地址空间」在 posix_spawn 的用法里
+   无所谓：子进程紧接着就 execve 把整个镜像换掉，父进程用 fork 的写时复制
+   本来就更安全。CLONE_VFORK 的「挂起父进程」同理可以不做。
+2. execve（nr=221）在本进程内换镜像，靠 longjmp 回 main 的加载循环：重新加载
+   新镜像、重建客户机栈、再跳一次入口。之所以必须 longjmp，是因为 execve 是从
+   蹦桌 → C 处理器 → impl 的深处被调用的，那里没有路能「不返回客户机旧代码」
+   地切到新入口。
+3. wait4（nr=260）落到 waitpid，并把状态编码从 BSD 形态翻成 Linux 形态
+   （退出码在 bits 8-15、信号在 bits 0-6）。不翻的话父进程读到的等待结果全错。
+4. execve 的 argv/envp 必须抄进宿主自己的缓冲区，不能只存客户机指针——
+   longjmp 之后 load_image2 会 MAP_FIXED 落到客户机窗口低端，把存着 argv
+   字符串的旧客户机栈整块盖掉。实测踩过：只存指针时 exec 出来的 echo
+   收不到任何参数（write 只写出一个换行）。
+5. fd 表在 execve 之后保持不动（Linux 的 execve 默认保留已打开的 fd，fork
+   出来的子进程本就继承了副本），区域表、guard 表、镜像表、brk 区、蹦桌池
+   全部重建；环境变量也换成客户机自己给的那份，不再透传宿主 environ。
 
-性能：mrs 拦截单次开销约 0.87 纳秒（约 3 个周期，实测两亿条 mrs 多花 0.17 秒）；
-端到端在噪声范围内（`sh -c true` 400 次 0.738 秒对 0.798 秒，`ls /` 400 次
-0.579 秒对 0.536 秒）。
+回归：tests/verify.sh 新增第 [8] 段三项——外部命令真的执行了、argv 真的传对了、
+退出码经 wait4 真的透传了。tests/stability.sh 的观测面扩到 8 个程序，并改用
+引擎自带的 MLC_WATCHDOG 把「永久挂起」单列：macOS 没有 timeout 命令，
+一次挂起就能把观测脚本卡死，v1.6 量化 K2 时正是这么卡住的。
 
 ## 一键安装
 
 双击 `MLC.command`（Finder 里右键→打开，或直接双击）。
-脚本依次做：检查 arm64 + clang → 解包 rootfs → 构建 src/mlc-core → 跑 25 项验证 →
+脚本依次做：检查 arm64 + clang → 解包 rootfs → 构建 src/mlc-core → 跑 28 项验证 →
 把 `mlc` 命令拷到 `~/.local/bin`。不装 Homebrew、不改系统配置、不留服务。
 卸载：删掉项目目录与 `~/.local/bin/mlc`，无残留。
 
@@ -74,7 +77,8 @@ mlc ls -la /                 # 列 rootfs 根目录
 mlc cat /etc/hostname        # 读 rootfs 里的文件
 mlc --list                   # rootfs 里可运行的程序清单
 mlc sh -c 'echo hi'          # 跑 sh（内建命令）
-bash tests/verify.sh         # 二十五项验证
+mlc sh -c 'ls /'            # 跑 sh 里的外部命令（fork/exec）
+bash tests/verify.sh         # 二十八项验证
 bash tests/stability.sh 200  # 偶发失败率观测（只报告，不作门禁）
 ```
 
@@ -113,6 +117,12 @@ bash tests/stability.sh 200  # 偶发失败率观测（只报告，不作门禁�
    这三个数原先没有上界，客户机参数可以直接踩宿主栈（F37）。
    auxv 的 AT_PAGESZ 报宿主真实页大小 16384——报 4096 会让 glibc 的段对齐
    与宿主页粒度错位，把同页内相邻映射的数据抹掉（F35）。
+6. fork/exec 三条路（v1.6）。clone 只认 posix_spawn 的 CLONE_VM|CLONE_VFORK|
+   SIGCHLD 与裸 fork 的 SIGCHLD，落到宿主 fork()，其余带 CLONE_THREAD 等位的
+   一律 ENOSYS。execve 记下路径与 argv/envp（字符串抄进宿主缓冲区，旧客户机栈
+   会被新镜像盖掉）后 longjmp 回 main 的加载循环，重新加载镜像、重建客户机栈、
+   再跳一次入口。wait4 走 waitpid 并把状态编码翻成 Linux 形态。
+   execve 保留 fd 表，区域表/guard 表/镜像表/brk 区/蹦桌池全部重建。
 
 ## 目录
 
@@ -123,7 +133,7 @@ bash tests/stability.sh 200  # 偶发失败率观测（只报告，不作门禁�
 - src/mlc 命令行入口（PATH 查找 + 退出码透传）
 - src/install.sh 手动安装（等价于 MLC.command）
 - scripts/unpack-rootfs.sh 按需解出 103MB 的 sysroot
-- tests/ 测试载荷生成器（mkelf.py 迷你链接器 + test.s + regs.s + tp.s）、验证脚本（25 项）、稳定性观测
+- tests/ 测试载荷生成器（mkelf.py 迷你链接器 + test.s + regs.s + tp.s）、验证脚本（28 项）、稳定性观测
 - rootfs/ubuntu-base-arm64.tar.gz Ubuntu Base 24.04.5 ARM64（29MB，解压后约 103MB）
 - docs/ 十份生命周期文档：调研、准备、计划、执行、验证、审计、安全、修复、落地、整改
 

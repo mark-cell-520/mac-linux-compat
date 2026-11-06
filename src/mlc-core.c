@@ -29,6 +29,8 @@
 #include <errno.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <sys/wait.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
@@ -53,8 +55,12 @@
 #define SYS_readlinkat     78
 #define SYS_fstat          80
 #define SYS_exit           93
+#define SYS_exit           93
 #define SYS_exit_group     94
 #define SYS_set_tid_address 96
+#define SYS_clone         220   // 进程创建：glibc 的 posix_spawn 与 fork 都走这条
+#define SYS_execve        221   // 替换当前镜像
+#define SYS_wait4         260   // 等待子进程
 #define SYS_futex          98
 #define SYS_set_robust_list 99
 #define SYS_nanosleep     101
@@ -755,6 +761,75 @@ static void tp_finish_write(void) {
     }
 }
 
+// ---------- fork/exec（B7，v1.6）----------
+// 客户机的进程模型只有两条路能落到宿主上：
+//   1. clone（nr=220）——glibc 的 posix_spawn 用 CLONE_VM|CLONE_VFORK|SIGCHLD
+//      （实测 a0=0x4111），裸 fork 用 SIGCHLD。macOS 没有 clone，用 fork() 落地。
+//      CLONE_VM 的「共享地址空间」在 posix_spawn 的用法里无所谓：子进程紧接着就
+//      execve 把整个镜像换掉，父进程那边用 fork 的写时复制本来就更安全
+//      （不存在「父子互相踩同一块」的窗口）。CLONE_VFORK 的「挂起父进程」同理
+//      可以不做：fork 之后父子地址空间已经独立，父进程继续跑不会破坏子进程。
+//   2. execve（nr=221）——在本进程内换镜像。做法是 longjmp 回 main 的加载循环，
+//      重新加载新镜像、重建客户机栈再跳一次。之所以必须 longjmp：execve 是从
+//      系统调用处理器深处（蹦桌 → C 处理器 → impl）被调用的，那里没有路能
+//      「不返回客户机旧代码」地切换到新入口。
+//
+// fd 表在 execve 之后保持不动的依据：Linux 的 execve 默认保留已打开的 fd
+// （除非带 O_CLOEXEC），而 fork 出来的子进程本就继承了父进程的 fd 表副本。
+// 蹦桌池、区域表、guard 表、镜像表、brk 区则全部重建——它们是旧镜像的私有簿记。
+#define GUEST_EXEC_ARGC_MAX 128
+#define GUEST_EXEC_ENVC_MAX 128
+#define GUEST_EXEC_STR_MAX 4096
+
+// execve 的 argv/envp 必须抄到宿主自己的缓冲区里，不能只存客户机指针。
+// 原因：longjmp 回 main 之后要重新加载新镜像，而 load_image2 是 MAP_FIXED 落到
+// 客户机窗口低端的——旧镜像的客户机栈（argv 字符串就在那儿）会被整块盖掉。
+// 实测踩过：只存指针时，建新栈读出来的 argv 全是空串，exec 出来的 echo
+// 收不到任何参数（write 只写出一个换行）。
+static char g_exec_argv_buf[GUEST_EXEC_ARGC_MAX][GUEST_EXEC_STR_MAX];
+static char g_exec_envp_buf[GUEST_EXEC_ENVC_MAX][GUEST_EXEC_STR_MAX];
+static jmp_buf g_exec_jmp;                 // longjmp 回 main 的加载循环
+static int g_exec_pending = 0;             // 有 execve 请求待处理
+static char g_exec_path[1024];             // 新镜像的客户机路径
+static char *g_exec_argv[GUEST_EXEC_ARGC_MAX];
+static int g_exec_argc;
+static char *g_exec_envp[GUEST_EXEC_ENVC_MAX];
+static int g_exec_envc;
+
+// execve 之前的旧镜像簿记清理。只清必须清的，其余留给新加载覆盖。
+static void guest_state_reset(void) {
+    // 目录句柄不跨 exec：先 closedir 再清表，否则 DIR* 与其内部 dup 的 fd 一起泄漏
+    for (int i = 0; i < GUEST_FD_MAX; i++) {
+        if (g_dir[i]) { closedir(g_dir[i]); g_dir[i] = NULL; }
+    }
+    // 旧 brk 预留区整块卸掉（32MB，不卸的话每次 exec 漏一块）
+    if (g_brk_start) {
+        munmap((void *)g_brk_start, (size_t)(g_brk_region_end - g_brk_start));
+        region_del(g_brk_start, g_brk_region_end);
+    }
+    g_brk_start = g_brk_cur = g_brk_region_end = 0;
+    // 蹦桌池回到起点：新镜像的蹦桌从头写。先把上次设为只读的池段恢复可写。
+    g_tp_rx_end = 0;
+    mprotect((void *)g_tp_base, (size_t)((uint64_t)g_tp_end - (uint64_t)g_tp_base),
+             PROT_READ | PROT_WRITE);
+    g_tp_next = g_tp_base;
+    // 簿记全部重建（fd 表不动）
+    g_region_n = 0;
+    g_guard_n = 0;
+    g_nimg = 0;
+    g_guest_tp_good = 0;
+    g_tp_fixups = 0;
+    g_tp_writes = 0;
+    g_tp_last_write = 0;
+    g_tp_last_restored = 0;
+    g_sc_last_nr = 0;
+    g_sc_total = 0;
+    for (int i = 0; i < 512; i++) g_sc_by_nr[i] = 0;   // volatile 数组不能用 memset
+    // 窗口游标回到两端，新镜像从低端重新 bump-up
+    g_win_low = g_win_base;
+    g_win_high = g_win_end;
+}
+
 
 // 客户机 msr TPIDR_EL0 的校验探针（由 tp-stub.s 调用）。
 // 返回真正要写进 TPIDR_EL0 的值。写入值够高就当它是有效 TCB 并记下来；
@@ -1364,6 +1439,85 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         return getpid();
     }
     case SYS_set_robust_list: return 0;
+    case SYS_clone: {
+        // B7：客户机创建进程。只支持两类用法，其余一律 ENOSYS（宁可诚实失败，
+        // 也不要给出一个语义不符的成功）：
+        //   a0 = 0x4111 = CLONE_VM|CLONE_VFORK|SIGCHLD —— glibc posix_spawn
+        //   a0 = 0x0011 = SIGCHLD                      —— glibc fork()
+        // 其它带 CLONE_THREAD/CLONE_SETTLS/CLONE_NEWNS 等位的用法属多线程与命名
+        // 空间，归 M3，当前没有实现也不假报成功。
+        unsigned long flags = (unsigned long)a0;
+        int is_spawn = (flags == 0x4111UL);
+        int is_fork  = (flags == 0x0011UL) || (flags == 0x0000UL);
+        if (!is_spawn && !is_fork) {
+            fprintf(stderr, "[mlc] clone：不支持的标志 0x%lx，返回 ENOSYS（多线程归 M3）\n", flags);
+            return -L_ENOSYS;
+        }
+        // 父进程的蹦桌池此时可能停在「可写」状态（某次 patch_svc_in_range 异常
+        // 返回），fork 之前先收尾成只读可执行，子进程才不会踩到半写状态。
+        tp_finish_write();
+        pid_t pid = fork();
+        if (pid < 0) return -errno;
+        if (pid == 0) {
+            // 子进程：诊断计数从零开始，蹦桌簿记按写时复制的现状继续用
+            g_sc_total = 0;
+            for (int i = 0; i < 512; i++) g_sc_by_nr[i] = 0;
+            return 0;
+        }
+        return (int64_t)pid;
+    }
+    case SYS_wait4: {
+        // Linux: wait4(pid, &status, options, &rusage)。status 的编码与宿主不同：
+        // Linux 把退出码放在 bits 8-15、终止信号放在 bits 0-6，BSD/macOS 用
+        // WEXITSTATUS/WTERMSIG 宏各自的位。不翻译的话父进程读到的等待结果全错。
+        int status = 0;
+        int opts = 0;
+        if (a2 & 0x00000001UL) opts |= WNOHANG;      // WNOHANG 两侧都是 1
+        if (a2 & 0x00000008UL) opts |= WUNTRACED;    // WUNTRACED：Linux 2，宿主 2
+        if (a1) {
+            if (!guest_ptr_ok(a1, 4)) return -L_EFAULT;
+        }
+        pid_t r = waitpid((pid_t)a0, a1 ? &status : NULL, opts);
+        if (r < 0) return -errno;
+        if (a1) {
+            int ls = 0;
+            if (WIFEXITED(status))       ls = (WEXITSTATUS(status) & 0xff) << 8;
+            else if (WIFSIGNALED(status)) ls = WTERMSIG(status) & 0x7f;
+            else if (WIFSTOPPED(status))  ls = (WSTOPSIG(status) & 0xff) << 8 | 0x7f;
+            *(int *)a1 = ls;
+        }
+        return (int64_t)r;
+    }
+    case SYS_execve: {
+        // B7：替换当前镜像。只记录请求后 longjmp 回 main 的加载循环——
+        // 从这里逐层返回客户机旧代码是错的（旧镜像马上就被换掉了）。
+        if (!a0 || !guest_str_ok(a0, 4096)) return -L_EFAULT;
+        snprintf(g_exec_path, sizeof(g_exec_path), "%s", (const char *)a0);
+        g_exec_argc = 0;
+        for (int i = 0; i < GUEST_EXEC_ARGC_MAX; i++) {
+            if (!guest_ptr_ok(a1 + (uint64_t)i * 8, 8)) return -L_EFAULT;
+            uint64_t s;
+            memcpy(&s, (const void *)(a1 + (uint64_t)i * 8), 8);
+            if (!s) break;
+            if (!guest_str_ok(s, GUEST_EXEC_STR_MAX)) return -L_EFAULT;
+            snprintf(g_exec_argv_buf[i], GUEST_EXEC_STR_MAX, "%s", (const char *)s);
+            g_exec_argv[i] = g_exec_argv_buf[i];
+            g_exec_argc++;
+        }
+        g_exec_envc = 0;
+        for (int i = 0; i < GUEST_EXEC_ENVC_MAX; i++) {
+            if (!guest_ptr_ok(a2 + (uint64_t)i * 8, 8)) return -L_EFAULT;
+            uint64_t s;
+            memcpy(&s, (const void *)(a2 + (uint64_t)i * 8), 8);
+            if (!s) break;
+            if (!guest_str_ok(s, GUEST_EXEC_STR_MAX)) return -L_EFAULT;
+            snprintf(g_exec_envp_buf[i], GUEST_EXEC_STR_MAX, "%s", (const char *)s);
+            g_exec_envp[i] = g_exec_envp_buf[i];
+            g_exec_envc++;
+        }
+        g_exec_pending = 1;
+        longjmp(g_exec_jmp, 1);
+    }
     case SYS_rseq:          return -L_ENOSYS;
     case SYS_membarrier:    return 0;
     case SYS_futex:         return 0;              // v1：视为无竞争（L4，M3 多线程前必须实现）
@@ -2072,8 +2226,30 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[mlc] rootfs 前缀: %s\n", g_rootfs);
 
     // 1. 加载主镜像
-    image_t *main_im = load_image(guest_path);
-    g_load_base = main_im->mem; g_load_end = main_im->mem + main_im->span;
+    // execve 会 longjmp 回这里形成循环：首次加载 guest_path，之后每次加载
+    // sys_execve 记下的 g_exec_path。fd 表只在首次初始化（execve 保留 fd）。
+    int is_exec = 0;
+    for (;;) {
+        if (setjmp(g_exec_jmp) != 0) {
+            // execve 请求到达。此时客户机旧镜像仍在内存里，sys_execve 记下的
+            // argv/envp 指针还可读；guest_state_reset 只清簿记，不动 fd 表。
+            is_exec = 1;
+            guest_state_reset();
+            fprintf(stderr, "[mlc] execve：%s（argc=%d envc=%d）\n",
+                    g_exec_path, g_exec_argc, g_exec_envc);
+        }
+        char load_path[1024];
+        if (is_exec) {
+            // execve 给的是客户机路径（如 /bin/echo），要重写进 rootfs。
+            // 首次运行的 guest_path 是调用方给的宿主路径，原样用——再重写一次
+            // 就会拼成 rootfs/rootfs/... 而打不开。
+            if (guest_to_host_path(g_exec_path, load_path, sizeof(load_path)) < 0)
+                die("镜像路径过长");
+        } else {
+            snprintf(load_path, sizeof(load_path), "%s", guest_path);
+        }
+        image_t *main_im = load_image(load_path);
+        g_load_base = main_im->mem; g_load_end = main_im->mem + main_im->span;
 
     // 2. 动态链接：有 PT_INTERP 就加载 interp，控制权交给 ld.so
     image_t *interp = NULL;
@@ -2114,9 +2290,11 @@ int main(int argc, char **argv) {
     if (interp) fprintf(stderr, "[mlc] 控制权将交给 interp（入口 0x%llx）\n",
                         (unsigned long long)interp->entry);
 
-    // 5. 客户机 fd 表初始化
-    for (int i = 0; i < GUEST_FD_MAX; i++) g_fd_map[i] = -1;
-    g_fd_map[0] = 0; g_fd_map[1] = 1; g_fd_map[2] = 2;
+    // 5. 客户机 fd 表初始化（仅首次；execve 保留已打开的 fd）
+    if (!is_exec) {
+        for (int i = 0; i < GUEST_FD_MAX; i++) g_fd_map[i] = -1;
+        g_fd_map[0] = 0; g_fd_map[1] = 1; g_fd_map[2] = 2;
+    }
 
     // 6. 搭建客户机栈
     // 栈顶留白：argv/envp 字符串从这里往下写。审计 F37：原为 4096，而真实
@@ -2137,8 +2315,16 @@ int main(int argc, char **argv) {
     #define GUEST_ARGC_MAX 128
     #define GUEST_ENVC_MAX 128
     #define GUEST_WORDS_MAX 512
-    int gargc = argc - 1;
-    char **gargv = &argv[1];
+    int gargc;
+    char **gargv;
+    if (is_exec) {
+        // g_exec_argv 已在 sys_execve 里抄成宿主缓冲区（客户机栈会被新镜像盖掉）
+        gargc = g_exec_argc;
+        gargv = g_exec_argv;
+    } else {
+        gargc = argc - 1;
+        gargv = &argv[1];
+    }
     if (gargc > GUEST_ARGC_MAX) {
         fprintf(stderr, "[mlc][致命] 参数过多（%d，上限 %d）\n", gargc, GUEST_ARGC_MAX);
         return 2;
@@ -2155,16 +2341,28 @@ int main(int argc, char **argv) {
         p -= l; memcpy(p, gargv[i], l); strptr[nstr++] = (uint64_t)p;
     }
     // v1.2：透传宿主环境变量（客户机需要 PATH、LD_DEBUG、LANG、MLC_ROOT 等），
-    // 只对缺失的几个关键项补默认值
+    // 只对缺失的几个关键项补默认值。
+    // execve 之后改用客户机自己给的那份 envp——execve 的语义就是换环境，
+    // 再透传宿主 environ 会让 PATH 之类回到宿主值，exec 出来的程序立刻跑偏。
     extern char **environ;
     uint64_t envptr[GUEST_ENVC_MAX]; int nenv = 0;
-    for (char **e = environ; *e && nenv < GUEST_ENVC_MAX; e++) {
-        size_t l = strlen(*e) + 1;
+    char **env_src; int env_count;
+    if (is_exec) {
+        env_src = g_exec_envp;
+        env_count = g_exec_envc;
+    } else {
+        env_src = environ;
+        env_count = -1;                       // 遍历到 NULL 为止
+    }
+    for (int i = 0; nenv < GUEST_ENVC_MAX; i++) {
+        if (env_count >= 0) { if (i >= env_count) break; }
+        else if (!env_src[i]) break;
+        size_t l = strlen(env_src[i]) + 1;
         if ((uint64_t)(p - l) < (uint64_t)(stack + GUEST_STACK_SLACK)) {
             fprintf(stderr, "[mlc][致命] 环境变量总量超出栈预留空间\n");
             return 2;
         }
-        p -= l; memcpy(p, *e, l); envptr[nenv++] = (uint64_t)p;
+        p -= l; memcpy(p, env_src[i], l); envptr[nenv++] = (uint64_t)p;
     }
     for (int i = 0; envp_def[i] && nenv < GUEST_ENVC_MAX; i++) {
         size_t fl = strcspn(envp_def[i], "=");
@@ -2176,7 +2374,20 @@ int main(int argc, char **argv) {
         size_t l = strlen(envp_def[i]) + 1;
         p -= l; memcpy(p, envp_def[i], l); envptr[nenv++] = (uint64_t)p;
     }
-    uint64_t execfn = strptr[0];   // argv[0] 即客户机路径（gargc>=1 已由上面保证）
+    // AT_EXECFN：argv[0]。execve 可能给空 argv（gargc=0），此时补一个可读的
+    // 占位——glibc 的 __libc_start_main 会读它，给空指针反而崩。
+    uint64_t execfn;
+    if (gargc > 0) {
+        execfn = strptr[0];
+    } else {
+        const char *self = is_exec ? g_exec_path : load_path;
+        size_t l = strlen(self) + 1;
+        if ((uint64_t)(p - l) < (uint64_t)(stack + GUEST_STACK_SLACK)) {
+            fprintf(stderr, "[mlc][致命] 客户机字符串超出栈预留空间\n");
+            return 2;
+        }
+        p -= l; memcpy(p, self, l); execfn = (uint64_t)p;
+    }
     uint64_t platform = 0;
     { const char *plat = "aarch64"; size_t l = strlen(plat) + 1; p -= l; memcpy(p, plat, l); platform = (uint64_t)p; }
     uint8_t randbytes[16]; arc4random_buf(randbytes, sizeof(randbytes));
@@ -2239,9 +2450,14 @@ int main(int argc, char **argv) {
             interp ? "（ld.so）" : "（主程序）");
 
     // 7. 跳转到客户机入口（不再返回）
+    // execve 会 longjmp 回循环开头重新加载，所以这里不能只是 unreachable——
+    // 万一 br 之后还能回来（例如客户机入口自己返回），就接着跑下一轮加载。
     __asm__ volatile(
         "mov sp, %0\n\t"
         "br  %1\n\t"
         :: "r"(guest_sp), "r"(jump_target) : "memory");
-    __builtin_unreachable();
+    // 到这里说明客户机入口返回了：按 Linux 语义这不该发生，直接按 127 收尾
+    fprintf(stderr, "[mlc][警告] 客户机入口返回了，按退出码 127 处理\n");
+    return 127;
+    }
 }
