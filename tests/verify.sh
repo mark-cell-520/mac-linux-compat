@@ -19,6 +19,7 @@ if clang -O2 -Wall -o "$SRC/mlc-core" "$SRC/mlc-core.c" 2>/dev/null; then ok "�
 echo "[1] 构建测试载荷"
 python3 "$TESTS/mkelf.py" "$TESTS/test.s" "$TESTS/test.elf" >/dev/null 2>&1 && ok "mkelf 生成" || bad "mkelf 生成"
 python3 "$TESTS/mkelf.py" "$TESTS/regs.s" "$TESTS/regs.elf" >/dev/null 2>&1 && ok "regs 载荷生成" || bad "regs 载荷生成"
+python3 "$TESTS/mkelf.py" "$TESTS/tp.s" "$TESTS/tp.elf" >/dev/null 2>&1 && ok "tp 载荷生成" || bad "tp 载荷生成"
 # 目录列举与文件读入的目标用 rootfs 内的自建子目录：
 # 客户机看到的 / 就是 rootfs（v1.2 路径重写语义），不能写真实 /tmp
 GUEST_TMP="$PROJECT_ROOT/rootfs/sysroot/tmp/mlc-dent-test"
@@ -88,6 +89,22 @@ echo "[6] 客户机寄存器跨系统调用保存"
 "$SRC/mlc-core" "$TESTS/regs.elf" >/dev/null 2>&1
 RC=$?
 [ $RC -eq 0 ] && ok "x10-x15/x24-x27/x29 跨系统调用原样保留" || bad "寄存器保存回归（退出码 $RC）"
+
+# 7. 客户机线程指针跨 msr/mrs 的完整性（v1.5 F55，缺陷 K1 的收口）
+# tp.elf 端到端钉住：msr 记下有效 TCB、野值被顶替、mrs 读回有效 TCB、
+# 七种目标寄存器（x0/x1/x9/x10/x19/x28/x30）都拿到同一个值、邻存寄存器不被踩、
+# 跨一次系统调用之后仍成立、以及「有效 TCB 未建立时 mrs 必须原样返回现场值」。
+# 去牙实测（把对应站点识别关掉后重跑）：
+#   msr 不拦截        → 退出码 4
+#   cbz 抹掉现场值    → 退出码 11
+#   movk 编码少写一位 → 退出码 99（存根本身崩溃）
+# 唯一没有牙的是「mrs 站点完全不拦截」：替换只在宿主越界写 TPIDR_EL0 时才触发，
+# 而客户机自己的写入全被 msr 存根接管，所以从载荷内部观测不到——那条路径的
+# 证据是 tests/stability.sh 的崩溃率归零，不是本断言。
+echo "[7] 客户机线程指针跨 msr/mrs 完整"
+"$SRC/mlc-core" "$TESTS/tp.elf" >/dev/null 2>&1
+RC=$?
+[ $RC -eq 0 ] && ok "msr 记下/顶替、mrs 读回有效 TCB，七种目标寄存器一致" || bad "线程指针回归（退出码 ${RC}）"
 
 echo
 echo "=== 结果: 通过 $PASS 项, 失败 $FAIL 项 ==="

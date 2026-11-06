@@ -6,6 +6,7 @@ src/probe1
 *.o
 tests/test.elf
 tests/regs.elf
+tests/tp.elf
 tests/regs.s.o
 tests/.audit*.err
 tests/.trace.err

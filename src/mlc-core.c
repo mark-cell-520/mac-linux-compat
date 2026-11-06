@@ -313,6 +313,51 @@ static const uint32_t ML_STUB[] = {
 #define ML_STUB_WORDS (sizeof(ML_STUB) / sizeof(ML_STUB[0]))   // 48 词 = 192 字节
 #define ML_STUB_SLOT  256u          // 每个 svc 修补点一份独立蹦桌副本（须 >= ML_STUB_WORDS*4）
 
+// 客户机 mrs xN, TPIDR_EL0 的读拦截存根（v1.5 F55，缺陷 K1 的收口）。
+// 编码由 clang 汇编后逐条比对确认（0xd51bd040|N 是 msr 写、0xd53bd040|N 才是 mrs 读，
+// 这两者最早认错过，害了一圈弯路）。
+//
+// 为什么拦读而不只是拦写：v1.4 已证实蹦桌在每次系统调用出口都把有效 TCB 写回了
+// TPIDR_EL0（崩溃现场「蹦桌末次还原」打印的一直是 0x10xxxxf80 一档的有效值），
+// 全 rootfs 816 个 ELF 里 msr TPIDR_EL0 只有 ld.so 两处且都已修补，崩溃运行里
+// 也没有任何信号到达——也就是说翻野发生在「最后一次系统调用之后、崩溃之前」那段
+// 只有客户机代码在跑的区间里，而客户机代码里没有任何 msr 会执行。写野值的只能是
+// macOS libSystem（实测它在宿主调用里确实会把 0x0/0x1006/0x1007 一类小值写进
+// TPIDR_EL0），但它凭什么在系统调用之间的间隙里能跑，目前没有可观测触发点。
+//
+// 既然拦不住写，就拦住读：客户机唯一拿到线程指针的入口就是 mrs xN, TPIDR_EL0。
+// 这里在出口统一核对——读出来跟已知有效 TCB 不一致，就换成有效 TCB。于是无论
+// TPIDR_EL0 被谁写野，客户机都看不到，glibc 的 TP 相对访问再也不会落到近零地址。
+//
+// 约束：单线程模型下 TPIDR_EL0 必须恒等于 g_guest_tp_good（蹦桌进宿主调用前清零、
+// 出口还原，客户机代码不会在清零期间运行）。多线程（M3）落地后这条要重做。
+static const uint32_t ML_MRS_STUB[] = {
+    0xd10083ffu,       // 0  sub  sp, sp, #0x20
+    0xa90007e0u,       // 1  stp  x0, x1, [sp]
+    0xa9012be9u,       // 2  stp  x9, x10, [sp, #0x10]
+    0xd53bd049u,       // 3  mrs  x9, tpidr_el0        ← 现场值
+    0xd280000au,       // 4  movz x10, #0              ┐ 立即数运行时修补
+    0xf2a0000au,       // 5  movk x10, #0, lsl #16     │ 指向 g_guest_tp_good
+    0xf2c0000au,       // 6  movk x10, #0, lsl #32     │
+    0xf2e0000au,       // 7  movk x10, #0, lsl #48     ┘
+    0xf940014au,       // 8  ldr  x10, [x10]           ← x10 = 有效 TCB（0 表示还没建立）
+    0xb400008au,       // 9  cbz  x10, notarmed        ← 未建立：跳到「取现场值」，不能抹掉它
+    0xeb0a013fu,       // 10 cmp  x9, x10
+    0x54000060u,       // 11 b.eq restore              ← 与有效 TCB 相同，直接用
+    0xaa0a03e9u,       // 12 mov  x9, x10              ← 野值顶替
+                        //    notarmed:（下标 13，由 cbz 落入）
+    0xaa0903eau,       // 13 mov  x10, x9              ← 选中的值搬进 x10（现场值或顶替值）
+                        //    restore:（下标 14，由 b.eq 落入）
+    0xa94007e0u,       // 14 ldp  x0, x1, [sp]         ← 先还原可能被覆盖的 x0/x1
+    0xf9400be9u,       // 15 ldr  x9, [sp, #0x10]      ← 还原原 x9（值已在 x10 里）
+    0xaa0a03e0u,       // 16 orr  xN, xzr, x10         ← 下标 16 运行时修补成目标寄存器
+    0x910083ffu,       // 17 add  sp, sp, #0x20
+    0x14000000u,       // 18 b    返回客户机            ← 末条 B 立即数运行时修补
+};
+#define ML_MRS_STUB_WORDS (sizeof(ML_MRS_STUB) / sizeof(ML_MRS_STUB[0]))   // 19 词 = 76 字节
+#define ML_MRS_STUB_IDX_ADDR 4    // movz/movk 四条：g_guest_tp_good 的地址
+#define ML_MRS_STUB_IDX_DST  16   // orr xN, xzr, x10：N 由被拦指令给出
+
 
 // 保存块布局（与 stub.s v5 对应）：下标 i 就是 x_i，即
 //   0..30 = x0..x30（x8 是 Linux 系统调用号），31 = 客户机 TPIDR_EL0，
@@ -352,6 +397,8 @@ static uint64_t g_guest_tp_good = 0;   // 最近一次见到的有效客户机 T
 static int g_tp_fixups = 0;            // 野值被顶替的次数（诊断用）
 static uint64_t g_tp_last_write = 0;    // TP 存根最后一次真正写进 TPIDR_EL0 的值
 static int g_tp_writes = 0;             // TP 存根被进入的次数
+static uint64_t g_tp_last_restored = 0; // 蹦桌最后一次 msr 回客户机的值（K1 排查）
+static uint64_t g_sc_last_nr = 0;       // 最后一次系统调用号（K1 排查）
 
 static int64_t mlc_syscall_handler(uint64_t *regs);
 static int64_t mlc_tp_write_probe(uint64_t *regs, int n);
@@ -672,6 +719,42 @@ static uint64_t tp_alloc(uint64_t len) {
     return r;
 }
 
+// 蹦桌池的「可写 / 可执行」切换。
+//
+// 为什么必须切：macOS 禁止匿名映射同时可写可执行（实测 mprotect 到 RWX 直接
+// EACCES），而蹦桌既要被引擎反复写（patch_svc_in_range 每次处理一个新映射的库
+// 都要往里写几百上千份副本），又要被客户机当指令跳。
+//
+// 曾经的两种错法：
+//   按 page_up(g_tp_next) 设只读——本次调用是安全了，可下一次调用分配的地址
+//   仍落在已设为只读的页里，写入即 SIGSEGV（libc 有 517 处 svc、上千处 mrs，
+//   一次动态链接就要跨几百页，迟早踩到）。
+//   按 page_down(g_tp_next) 设只读——当前未写满的那一页保持可写，于是落在
+//   这一页里的蹦桌不可执行，客户机一跳过去就是 SIGBUS（v1.5 实测：
+//   ls -la / 崩 199/200，故障指令正是 mrs 存根首条 sub sp, sp, #0x20）。
+//
+// 现在的口径：写之前把已设为只读的整段恢复可写，写完之后再把已用整段设为只读
+// 可执行。安全性在于 patch_svc_in_range 只从系统调用处理器内部被调用，切换发生
+// 时客户机代码根本没有在跑（客户机只在两次系统调用之间运行），不存在「客户机
+// 正踩着某条蹦桌时被改保护」的窗口。
+static uint64_t g_tp_rx_end = 0;    // 已设为只读可执行的末尾（页对齐），0 表示可写
+
+static void tp_prepare_write(void) {
+    if (g_tp_rx_end > (uint64_t)g_tp_base)
+        mprotect((void *)g_tp_base, (size_t)(g_tp_rx_end - (uint64_t)g_tp_base),
+                 PROT_READ | PROT_WRITE);
+    g_tp_rx_end = 0;
+}
+
+static void tp_finish_write(void) {
+    uint64_t used = page_up((uint64_t)g_tp_next);
+    if (used > (uint64_t)g_tp_base) {
+        mprotect((void *)g_tp_base, (size_t)(used - (uint64_t)g_tp_base),
+                 PROT_READ | PROT_EXEC);
+        g_tp_rx_end = used;
+    }
+}
+
 
 // 客户机 msr TPIDR_EL0 的校验探针（由 tp-stub.s 调用）。
 // 返回真正要写进 TPIDR_EL0 的值。写入值够高就当它是有效 TCB 并记下来；
@@ -709,6 +792,7 @@ static int64_t mlc_tp_write_probe(uint64_t *regs, int n) {
 // 当成自己的槽位，写野值会让 glibc 的 TP 相对访问落到近零地址上（缺陷 K1）。
 static int patch_svc_in_range(uint8_t *content, size_t nbytes) {
     if (!content || nbytes < 4) return 0;
+    tp_prepare_write();          // 先把上次设为只读的池段恢复可写
     uint32_t *w = (uint32_t *)content;
     size_t nwords = nbytes / 4;
     int patched = 0;
@@ -718,15 +802,21 @@ static int patch_svc_in_range(uint8_t *content, size_t nbytes) {
     uint64_t tpfn = (uint64_t)(void *)&mlc_tp_write_probe;
     uint32_t tphalves[4] = { (uint32_t)(tpfn & 0xFFFF), (uint32_t)((tpfn >> 16) & 0xFFFF),
                              (uint32_t)((tpfn >> 32) & 0xFFFF), (uint32_t)((tpfn >> 48) & 0xFFFF) };
+    uint64_t tpgood = (uint64_t)(void *)&g_guest_tp_good;
+    uint32_t tghalves[4] = { (uint32_t)(tpgood & 0xFFFF), (uint32_t)((tpgood >> 16) & 0xFFFF),
+                             (uint32_t)((tpgood >> 32) & 0xFFFF), (uint32_t)((tpgood >> 48) & 0xFFFF) };
     for (size_t j = 0; j < nwords; j++) {
         int is_svc = (w[j] == 0xD4000001u);
         // msr TPIDR_EL0, xN：N 取 0..30，31 是 xzr（写 0，同样要拦）
         int is_msr_tp = (w[j] >= 0xD51BD040u && w[j] <= 0xD51BD05Fu);
-        if (!is_svc && !is_msr_tp) continue;
+        // mrs xN, TPIDR_EL0：读线程指针。N=31（xzr）读了也没用，不拦
+        int is_mrs_tp = (w[j] >= 0xD53BD040u && w[j] <= 0xD53BD05Eu);
+        if (!is_svc && !is_msr_tp && !is_mrs_tp) continue;
         uint64_t stub = tp_alloc(ML_STUB_SLOT);
         if (!stub) {
             fprintf(stderr, "[mlc] 警告: 蹦桌池不足，此处 %s 不拦截（PC=0x%llx）\n",
-                    is_svc ? "svc" : "msr TPIDR_EL0", (unsigned long long)(uintptr_t)&w[j]);
+                    is_svc ? "svc" : (is_msr_tp ? "msr TPIDR_EL0" : "mrs TPIDR_EL0"),
+                    (unsigned long long)(uintptr_t)&w[j]);
             break;
         }
         uint32_t *t = (uint32_t *)stub;
@@ -736,7 +826,7 @@ static int patch_svc_in_range(uint8_t *content, size_t nbytes) {
             nwords_stub = ML_STUB_WORDS;
             for (int h = 0; h < 4; h++)
                 t[21 + h] = (t[21 + h] & ~(0xFFFFU << 5)) | ((halves[h] & 0xFFFF) << 5);
-        } else {
+        } else if (is_msr_tp) {
             memcpy(t, ML_TP_STUB, sizeof(ML_TP_STUB));
             nwords_stub = ML_TP_STUB_WORDS;
             // 参数 2 = 被写寄存器下标（movz w1, #N）
@@ -744,6 +834,14 @@ static int patch_svc_in_range(uint8_t *content, size_t nbytes) {
             for (int h = 0; h < 4; h++)
                 t[ML_TP_STUB_IDX_FN + h] =
                     (t[ML_TP_STUB_IDX_FN + h] & ~(0xFFFFU << 5)) | ((tphalves[h] & 0xFFFF) << 5);
+        } else {
+            memcpy(t, ML_MRS_STUB, sizeof(ML_MRS_STUB));
+            nwords_stub = ML_MRS_STUB_WORDS;
+            for (int h = 0; h < 4; h++)
+                t[ML_MRS_STUB_IDX_ADDR + h] =
+                    (t[ML_MRS_STUB_IDX_ADDR + h] & ~(0xFFFFU << 5)) | ((tghalves[h] & 0xFFFF) << 5);
+            // 目标寄存器：orr xN, xzr, x10（N=0..30）
+            t[ML_MRS_STUB_IDX_DST] = 0xAA0A03E0u | (w[j] & 31u);
         }
         int64_t to_stub = (int64_t)stub - (int64_t)&w[j];
         int64_t to_ret  = (int64_t)(&w[j] + 1) - (int64_t)(stub + (nwords_stub - 1) * 4);
@@ -754,12 +852,12 @@ static int patch_svc_in_range(uint8_t *content, size_t nbytes) {
         bret[0] = 0x14000000u | ((uint32_t)(to_ret / 4) & 0x03FFFFFFu);
         patched++;
     }
-    if (patched) {
-        // 池内新写的蹦桌要设为可执行（池是整块 RW，逐次放大保护范围太碎，
-        // 这里直接把池整体设为 RX：池只由引擎写，客户机不可见）
-        mprotect((void *)g_tp_base, (size_t)(page_up((uint64_t)g_tp_next) - (uint64_t)g_tp_base),
-                 PROT_READ | PROT_EXEC);
-    }
+    // 无条件收尾，不能只在 patched 非零时收：mprotect 补扫那条路（SYS_mprotect）
+    // 常常一个站点都不命中，而 tp_prepare_write 已经把池子恢复成可写了——
+    // 此时若不设回只读可执行就返回客户机，客户机一跳蹦桌就是 SIGBUS。
+    // v1.5 实测：ls -la / 崩 199/200，故障页 prot=3（可写不可执行），
+    // 崩溃前最后一次系统调用正是 nr=226。
+    tp_finish_write();
     return patched;
 }
 
@@ -1501,16 +1599,20 @@ static image_t *load_image2(const char *path, int from_high) {
     // ld.so 按 phdr 推算主程序映射末端，若我们的映射多占 GAP+蹦桌，
     // 它的 MAP_FIXED 会落回我们映射内部而被保护区拒绝（v1.2 修）。
     // 先数本镜像可执行段里要拦的指令，蹦桌区随之定大小（紧随映射，同一次分配）。
-    // 两类都拦：svc #0（0xD4000001）与 msr TPIDR_EL0, xN（0xD51BD040|N）。
-    // 后者只有 ld.so 有（全 rootfs 扫过，libc 与所有程序、库一处都没有），
-    // 而 ld.so 正是走本函数加载的——漏了这里，K1 的线程指针校验就形同虚设。
+    // 三类都拦：svc #0（0xD4000001）、msr TPIDR_EL0, xN（0xD51BD040|N，写线程指针）、
+    // mrs xN, TPIDR_EL0（0xD53BD040|N，读线程指针）。后两类只有 ld.so 与 libc 一类
+    // 的库有（全 rootfs 扫过），而它们正是走本函数与 patch_svc_in_range 加载的——
+    // 漏了这里，K1 的线程指针校验就形同虚设。注意 0xD53BD040 是 mrs 不是 msr，
+    // 这点 v1.4 排查时认错过，把 libc 的 1530 处读全当成写，白跑一圈。
     int nsvc = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
         uint32_t *s0 = (uint32_t *)(img + ph[i].p_offset);
         for (size_t j = 0; j < ph[i].p_filesz / 4; j++) {
             uint32_t v = s0[j];
-            if (v == 0xD4000001u || (v >= 0xD51BD040u && v <= 0xD51BD05Fu)) nsvc++;
+            if (v == 0xD4000001u ||
+                (v >= 0xD51BD040u && v <= 0xD51BD05Fu) ||
+                (v >= 0xD53BD040u && v <= 0xD53BD05Eu)) nsvc++;
         }
     }
     const uint64_t TRAMP_GAP = 0x10000;
@@ -1585,6 +1687,9 @@ static image_t *load_image2(const char *path, int from_high) {
         uint64_t tpfn = (uint64_t)(void *)&mlc_tp_write_probe;
         uint32_t tphalves[4] = { (uint32_t)(tpfn & 0xFFFF), (uint32_t)((tpfn >> 16) & 0xFFFF),
                                  (uint32_t)((tpfn >> 32) & 0xFFFF), (uint32_t)((tpfn >> 48) & 0xFFFF) };
+        uint64_t tpgood = (uint64_t)(void *)&g_guest_tp_good;
+        uint32_t tghalves[4] = { (uint32_t)(tpgood & 0xFFFF), (uint32_t)((tpgood >> 16) & 0xFFFF),
+                                 (uint32_t)((tpgood >> 32) & 0xFFFF), (uint32_t)((tpgood >> 48) & 0xFFFF) };
         for (int i = 0; i < eh->e_phnum; i++) {
             if (ph[i].p_type != PT_LOAD || !(ph[i].p_flags & PF_X)) continue;
             uint32_t *svc = (uint32_t *)(lbase + ph[i].p_vaddr);
@@ -1593,7 +1698,8 @@ static image_t *load_image2(const char *path, int from_high) {
                 uint32_t v = svc[j];
                 int is_svc = (v == 0xD4000001u);
                 int is_msr_tp = (v >= 0xD51BD040u && v <= 0xD51BD05Fu);
-                if (!is_svc && !is_msr_tp) continue;
+                int is_mrs_tp = (v >= 0xD53BD040u && v <= 0xD53BD05Eu);
+                if (!is_svc && !is_msr_tp && !is_mrs_tp) continue;
                 uint64_t stub = tramp_base + (uint64_t)patched * ML_STUB_SLOT;
                 uint32_t *t = (uint32_t *)stub;
                 int nwords_stub;
@@ -1602,7 +1708,7 @@ static image_t *load_image2(const char *path, int from_high) {
                     nwords_stub = ML_STUB_WORDS;
                     for (int h = 0; h < 4; h++)
                         t[21 + h] = (t[21 + h] & ~(0xFFFFU << 5)) | ((halves[h] & 0xFFFF) << 5);
-                } else {
+                } else if (is_msr_tp) {
                     memcpy(t, ML_TP_STUB, sizeof(ML_TP_STUB));
                     nwords_stub = ML_TP_STUB_WORDS;
                     // 参数 2 = 被写寄存器下标（movz w1, #N）
@@ -1610,6 +1716,13 @@ static image_t *load_image2(const char *path, int from_high) {
                     for (int h = 0; h < 4; h++)
                         t[ML_TP_STUB_IDX_FN + h] =
                             (t[ML_TP_STUB_IDX_FN + h] & ~(0xFFFFU << 5)) | ((tphalves[h] & 0xFFFF) << 5);
+                } else {
+                    memcpy(t, ML_MRS_STUB, sizeof(ML_MRS_STUB));
+                    nwords_stub = ML_MRS_STUB_WORDS;
+                    for (int h = 0; h < 4; h++)
+                        t[ML_MRS_STUB_IDX_ADDR + h] =
+                            (t[ML_MRS_STUB_IDX_ADDR + h] & ~(0xFFFFU << 5)) | ((tghalves[h] & 0xFFFF) << 5);
+                    t[ML_MRS_STUB_IDX_DST] = 0xAA0A03E0u | (v & 31u);
                 }
                 int64_t to_stub = (int64_t)stub - (int64_t)&svc[j];
                 int64_t to_ret  = (int64_t)(&svc[j] + 1) - (int64_t)(stub + (nwords_stub - 1) * 4);
@@ -1628,7 +1741,8 @@ static image_t *load_image2(const char *path, int from_high) {
                              PROT_READ | PROT_EXEC) < 0)
             die("蹦桌 mprotect 失败");
     }
-    fprintf(stderr, "[mlc] 加载 %s：基址 0x%llx，跨度 %llu，入口 0x%llx，svc 修补 %d 处\n",
+    fprintf(stderr, "[mlc] 加载 %s：基址 0x%llx，跨度 %llu，入口 0x%llx，拦截 %d 处"
+                    "（svc + msr/mrs TPIDR_EL0）\n",
             im->name, (unsigned long long)lbase, (unsigned long long)span,
             (unsigned long long)im->entry, patched);
 
@@ -1711,6 +1825,11 @@ static int64_t mlc_syscall_handler(uint64_t *regs) {
     static int trace = -1;
     if (trace < 0) trace = getenv("MLC_DEBUG") ? 1 : 0;
     int64_t r = mlc_syscall_handler_impl(regs);
+    // K1 排查：regs[REG_TPIDR] 此刻就是蹦桌出口 msr tpidr_el0 将要写回的值。
+    // 崩溃时把它与现场读到的 TPIDR_EL0 对比：相等说明翻野发生在最后一次系统调用
+    // 之后的纯客户机代码里；不相等说明蹦桌的还原本身就漏了。
+    g_tp_last_restored = regs[REG_TPIDR];
+    g_sc_last_nr = regs[REG_X8];
     // 出口探针：此时 stub.s 的 msr tpidr_el0 还原还没执行（它在 blr 返回之后），
     // 所以这里读到的是「宿主调用之后」的值。若它不等于入口的保存值，
     // 说明宿主 libSystem 在我们清零之后自己写了 TPIDR_EL0。
@@ -1745,6 +1864,8 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     fprintf(stderr, "[mlc][崩溃] TP 存根进入 %d 次，最后写入 0x%llx，有效 TCB 0x%llx，野值顶替 %d 次\n",
             g_tp_writes, (unsigned long long)g_tp_last_write,
             (unsigned long long)g_guest_tp_good, g_tp_fixups);
+    fprintf(stderr, "[mlc][崩溃] 蹦桌末次还原 0x%llx（系统调用 nr=%llu）\n",
+            (unsigned long long)g_tp_last_restored, (unsigned long long)g_sc_last_nr);
     fprintf(stderr, "[mlc][崩溃] 信号 %d 故障地址 %p PC=0x%llx LR=0x%llx SP=0x%llx\n",
             sig, info->si_addr, (unsigned long long)pc,
             (unsigned long long)uc->uc_mcontext->__ss.__lr,
@@ -1826,6 +1947,31 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
                         g_img[i].name, (unsigned long long)(pc - g_img[i].base));
         }
     }
+    // 残留 msr TPIDR_EL0 扫描（MLC_TP_SCAN=1）：K1 排查用。
+    // 已知野值只可能由 msr TPIDR_EL0, xN 写出来，而全 rootfs 816 个 ELF 静态
+    // 扫描只有 ld.so 两处（都已修补）。若这里还能扫到，说明有站点漏拦——那就是根因。
+    // 只扫 PC 所在区域与前后各 64KB：PC 一定落在已映射内存里，不会在信号处理里二次崩溃。
+    if (getenv("MLC_TP_SCAN")) {
+        int found = 0;
+        uint64_t lo = (pc > 0x10000) ? pc - 0x10000 : 0x1000;
+        uint64_t hi = pc + 0x10000;
+        for (int i = 0; i < g_region_n; i++) {
+            uint64_t s = g_region[i].start, e = g_region[i].end;
+            if (e <= lo || s >= hi) continue;
+            uint64_t a = (s > lo) ? s : lo, b = (e < hi) ? e : hi;
+            a &= ~3ULL; b &= ~3ULL;
+            for (uint64_t p = a; p + 4 <= b; p += 4) {
+                uint32_t w = *(uint32_t *)p;
+                if (w >= 0xD51BD040u && w <= 0xD51BD05Fu) {
+                    if (found < 16)
+                        fprintf(stderr, "[mlc][崩溃] 残留 msr TPIDR_EL0 @0x%llx enc=%08x\n",
+                                (unsigned long long)p, w);
+                    found++;
+                }
+            }
+        }
+        fprintf(stderr, "[mlc][崩溃] PC 前后 64KB 内残留 msr TPIDR_EL0 共 %d 处\n", found);
+    }
     _exit(99);
 }
 
@@ -1875,6 +2021,21 @@ static void watchdog_handler(int sig, siginfo_t *info, void *ctx) {
     _exit(88);
 }
 
+// ---------- 信号监听（MLC_SIG_LOG=1，K1 排查）----------
+// K1 的未解之处：蹦桌在最后一次系统调用出口把有效 TCB 写回了 TPIDR_EL0，
+// 之后只剩客户机代码在跑，而全 rootfs 816 个 ELF 里只有 ld.so 两处
+// msr TPIDR_EL0 且都已修补——客户机代码不可能写它。剩下的唯一能让宿主代码
+// 在两个系统调用之间插进来的机制就是信号。这里把所有可捕获信号都记下来，
+// 用来看崩溃前到底有没有信号到达、到达的是哪一个。
+static void sig_log_handler(int sig, siginfo_t *info, void *ctx) {
+    ucontext_t *uc = (ucontext_t *)ctx;
+    uint64_t tp = 0;
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    fprintf(stderr, "[mlc][信号] 收到 %d，PC=0x%llx TPIDR_EL0=0x%llx si_addr=%p\n",
+            sig, (unsigned long long)uc->uc_mcontext->__ss.__pc,
+            (unsigned long long)tp, info ? info->si_addr : NULL);
+}
+
 int main(int argc, char **argv) {
     // stderr 必须是裸写的：诊断要经 _exit() 退出，任何缓冲都会在退出时丢掉
     setbuf(stderr, NULL);
@@ -1883,6 +2044,16 @@ int main(int argc, char **argv) {
     sigaction(SIGBUS, &sa, NULL); sigaction(SIGSEGV, &sa, NULL);
     // SIGSYS：客户机执行了未被拦截的 svc #0。打 PC 与故障指令，用来定位漏拦位置
     sigaction(SIGSYS, &sa, NULL); sigaction(SIGILL, &sa, NULL);
+    if (getenv("MLC_SIG_LOG")) {
+        struct sigaction la = {0};
+        la.sa_sigaction = sig_log_handler; la.sa_flags = SA_SIGINFO;
+        for (int s = 1; s <= 31; s++) {
+            if (s == SIGSEGV || s == SIGBUS || s == SIGILL || s == SIGSYS ||
+                s == SIGALRM || s == SIGKILL || s == SIGSTOP) continue;
+            sigaction(s, &la, NULL);
+        }
+        fprintf(stderr, "[mlc] 信号监听已启用\n");
+    }
     if (getenv("MLC_WATCHDOG")) {
         struct sigaction wa = {0};
         wa.sa_sigaction = watchdog_handler; wa.sa_flags = SA_SIGINFO;

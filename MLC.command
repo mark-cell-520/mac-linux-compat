@@ -32,7 +32,7 @@ clang -O2 -Wall -o "$SRC/mlc-core" "$SRC/mlc-core.c" || die "编译失败"
 log "构建完成：$SRC/mlc-core"
 
 # 4. 自检
-log "运行验证套件（23 项）..."
+log "运行验证套件（25 项）..."
 bash "$MLC_HOME/tests/verify.sh" || die "验证未通过，安装中止"
 
 # 5. 装 mlc 命令
