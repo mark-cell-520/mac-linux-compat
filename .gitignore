@@ -1,0 +1,14 @@
+# 构建产物
+src/mlc-core
+src/mlc-old
+src/mlc-core-old.c
+src/probe1
+*.o
+tests/test.elf
+tests/.audit*.err
+tests/.trace.err
+.DS_Store
+
+# rootfs 解压产物：仓库里只放 29MB 的 tarball，解压出来的 103MB 不入库。
+# 一键安装（MLC.command）与 src/install.sh 都会在 sysroot 缺失时自动解压。
+rootfs/sysroot/

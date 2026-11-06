@@ -1,0 +1,68 @@
+#!/bin/bash
+# ============================================================
+# MLC 命令行入口：mlc <linux-arm64-程序> [参数...]
+#
+# 与直接调 mlc-core 的区别：这里负责在 rootfs 里按客户机 PATH 找程序、
+# 透传参数、原样返回客户机退出码。翻译器本体仍是 src/mlc-core。
+# ============================================================
+set -uo pipefail
+
+MLC_HOME="${MLC_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+CORE="$MLC_HOME/src/mlc-core"
+ROOTFS="$MLC_HOME/rootfs/sysroot"
+
+# 客户机 PATH：与 Ubuntu base 默认一致，rootfs 里没有的目录自动跳过
+GUEST_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+die() { echo "mlc: $*" >&2; exit 127; }
+
+[ -x "$CORE" ] || {
+    echo "mlc: 找不到 $CORE，先跑一次安装（MLC.command 或 src/install.sh）" >&2
+    exit 127
+}
+[ -d "$ROOTFS" ] || die "找不到 rootfs：$ROOTFS"
+
+[ $# -ge 1 ] || {
+    cat >&2 <<EOF
+用法: mlc <程序> [参数...]
+     mlc --list              列出 rootfs 里可运行的程序
+     mlc --path <客户机路径>  直接指定客户机绝对路径
+
+示例: mlc ls -la /
+      mlc cat /etc/hostname
+      mlc bash -c 'echo hi'
+EOF
+    exit 2
+}
+
+case "$1" in
+    --list)
+        for d in $(echo "$GUEST_PATH" | tr ':' ' '); do
+            [ -d "$ROOTFS$d" ] || continue
+            for f in "$ROOTFS$d"/*; do
+                [ -f "$f" ] && [ -x "$f" ] || continue
+                printf '%s\n' "${f#$ROOTFS}"
+            done
+        done | sort -u
+        exit 0
+        ;;
+    --path)
+        [ $# -ge 2 ] || die "--path 需要客户机绝对路径"
+        GPATH="$2"; shift 2
+        ;;
+    *)
+        GPATH=""
+        for d in $(echo "$GUEST_PATH" | tr ':' ' '); do
+            if [ -x "$ROOTFS$d/$1" ]; then GPATH="$d/$1"; break; fi
+        done
+        [ -n "$GPATH" ] || die "rootfs 里找不到程序：$1（mlc --list 看有哪些）"
+        shift
+        ;;
+esac
+
+HPATH="$ROOTFS$GPATH"
+[ -f "$HPATH" ] || die "客户机路径不存在：$GPATH"
+[ -x "$HPATH" ] || die "客户机程序没有可执行位：$GPATH"
+
+# 退出码原样透传：客户机 exit(3) 就得让 shell 看到 3
+exec "$CORE" "$HPATH" "$@"
