@@ -7,7 +7,36 @@
 # ============================================================
 set -uo pipefail
 
-MLC_HOME="${MLC_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# 安装位置探测。这份脚本会被拷到 ~/.local/bin/mlc，那时"脚本所在目录的上一级"
+# 是 ~/.local 而不是项目根，CORE 与 ROOTFS 全都指向不存在的地方。
+# 因此安装时会把真实项目根写进 INSTALL_HOME（留空表示就在项目里直接跑）。
+# 顺序：环境变量 MLC_HOME > 安装时写死的 INSTALL_HOME > 脚本相对位置。
+INSTALL_HOME=""
+
+find_home() {
+    if [ -n "${MLC_HOME:-}" ] && [ -x "${MLC_HOME}/src/mlc-core" ]; then
+        printf '%s\n' "${MLC_HOME}"; return 0
+    fi
+    if [ -n "$INSTALL_HOME" ] && [ -x "$INSTALL_HOME/src/mlc-core" ]; then
+        printf '%s\n' "$INSTALL_HOME"; return 0
+    fi
+    local self
+    self="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+    if [ -n "$self" ] && [ -x "$self/src/mlc-core" ]; then
+        printf '%s\n' "$self"; return 0
+    fi
+    return 1
+}
+
+if ! MLC_HOME="$(find_home)"; then
+    # 全角标点必须写成 ${CORE}：bash 3.2 在 LC_CTYPE=C.UTF-8 下会把紧邻的全角
+    # 字符并进变量名，$CORE，会被解析成变量 CORE，set -u 直接让脚本退出
+    # （2026-11-06 实测复现，同一个坑在本项目已第三次出现）
+    echo "mlc: 找不到 src/mlc-core。若把 mlc 拷到了别处，请在 INSTALL_HOME 里填项目根目录" >&2
+    echo "mlc: 或设环境变量 MLC_HOME=/路径/mac-linux-compat" >&2
+    exit 127
+fi
+
 CORE="$MLC_HOME/src/mlc-core"
 ROOTFS="$MLC_HOME/rootfs/sysroot"
 
@@ -16,11 +45,8 @@ GUEST_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 die() { echo "mlc: $*" >&2; exit 127; }
 
-[ -x "$CORE" ] || {
-    echo "mlc: 找不到 $CORE，先跑一次安装（MLC.command 或 src/install.sh）" >&2
-    exit 127
-}
-[ -d "$ROOTFS" ] || die "找不到 rootfs：$ROOTFS"
+[ -x "$CORE" ] || die "找不到翻译器核心：${CORE}"
+[ -d "$ROOTFS" ] || die "找不到 rootfs：${ROOTFS}"
 
 [ $# -ge 1 ] || {
     cat >&2 <<EOF
@@ -55,7 +81,7 @@ case "$1" in
         for d in $(echo "$GUEST_PATH" | tr ':' ' '); do
             if [ -x "$ROOTFS$d/$1" ]; then GPATH="$d/$1"; break; fi
         done
-        [ -n "$GPATH" ] || die "rootfs 里找不到程序：$1（mlc --list 看有哪些）"
+        [ -n "${GPATH}" ] || die "rootfs 里找不到程序：$1（mlc --list 看有哪些）"
         shift
         ;;
 esac

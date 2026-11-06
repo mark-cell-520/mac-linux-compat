@@ -88,7 +88,7 @@ rm -f "$TESTS/.audit.err" "$TESTS/.audit2.err"
 echo "[6] 客户机寄存器跨系统调用保存"
 "$SRC/mlc-core" "$TESTS/regs.elf" >/dev/null 2>&1
 RC=$?
-[ $RC -eq 0 ] && ok "x10-x15/x24-x27/x29 跨系统调用原样保留" || bad "寄存器保存回归（退出码 $RC）"
+[ $RC -eq 0 ] && ok "x10-x15/x24-x27/x29 跨系统调用原样保留" || bad "寄存器保存回归（退出码 ${RC}）"
 
 # 7. 客户机线程指针跨 msr/mrs 的完整性（v1.5 F55，缺陷 K1 的收口）
 # tp.elf 端到端钉住：msr 记下有效 TCB、野值被顶替、mrs 读回有效 TCB、
@@ -153,6 +153,65 @@ N_OUT=$("$SRC/mlc" sh -c '[ -f /definitely-not-here-xyz ] && echo bad' 2>/dev/nu
 # 这条同时是 PATH 搜索能否走通的判据：dash 靠 S_ISREG 决定要不要 exec
 P_OUT=$("$SRC/mlc" sh -c 'ls /' 2>/dev/null | head -1); PRC=${PIPESTATUS[0]}
 [ -n "$P_OUT" ] && ok "PATH 搜索能定位并执行外部命令" || bad "PATH 搜索仍然失败（退出码 ${PRC}）"
+
+# 9. 装到别处之后的 mlc 仍能跑（v1.6 之后发现的产品缺陷 F60）
+# MLC.command 与 src/install.sh 都会把 src/mlc 拷到 ~/.local/bin/mlc。拷过去之后
+# "脚本上一级"是 ~/.local 而不是项目根，MLC_HOME 会算成 ~/.local/src/mlc-core，
+# 于是一运行就退 127。以前从没被发现，因为安装完都是在项目里直接调 src/mlc。
+# 去牙实测（把 INSTALL_HOME 写死那行删掉后重跑）：下面两条立刻变红。
+echo "[9] mlc 拷到别处后仍能定位项目根"
+FAKE_BIN="$TESTS/.fakebin"
+rm -rf "$FAKE_BIN" && mkdir -p "$FAKE_BIN"
+cp "$SRC/mlc" "$FAKE_BIN/mlc"
+chmod +x "$FAKE_BIN/mlc"
+# 复刻安装脚本的动作：把真实项目根写进 INSTALL_HOME
+sed -i '' "s|^INSTALL_HOME=\"\"|INSTALL_HOME=\"$PROJECT_ROOT\"|" "$FAKE_BIN/mlc"
+FB_OUT=$("$FAKE_BIN/mlc" echo INSTALL_PATH_OK 2>/dev/null); FBRC=$?
+case "$FB_OUT" in
+    *INSTALL_PATH_OK*) [ $FBRC -eq 0 ] && ok "拷贝后的 mlc 经 INSTALL_HOME 找到项目根" || bad "拷贝后的 mlc 输出对但退出码 ${FBRC}" ;;
+    *) bad "拷贝后的 mlc 找不到项目根（退出码 ${FBRC}，输出 [$FB_OUT]）" ;;
+esac
+# 反向：环境变量 MLC_HOME 优先，必须压过 INSTALL_HOME
+ENV_OUT=$(MLC_HOME="$PROJECT_ROOT" "$FAKE_BIN/mlc" echo ENV_OVERRIDE_OK 2>/dev/null); ENVRC=$?
+case "$ENV_OUT" in
+    *ENV_OVERRIDE_OK*) [ $ENVRC -eq 0 ] && ok "MLC_HOME 环境变量优先生效" || bad "MLC_HOME 覆盖后退出码 ${ENVRC}" ;;
+    *) bad "MLC_HOME 覆盖无效（退出码 ${ENVRC}，输出 [$ENV_OUT]）" ;;
+esac
+rm -rf "$FAKE_BIN"
+
+# 10. glibc 真正的 fork 与 fcntl F_DUPFD（2026-11-06 用户试用时发现）
+# 两个缺陷都是从"装好之后真的去用"暴露出来的，前 32 项全都绿着：
+# (a) clone 只认 0x4111（posix_spawn）与裸 0x0011，漏了 glibc 2.39 真正的
+#     fork()：SIGCHLD|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID = 0x1200011。
+#     于是 dash 的命令替换、反引号、管道、以及任何带重定向的外部命令全部
+#     Cannot fork、退出码 2。posix_spawn 与 fork 是两条不同的 clone 调用，
+#     只测通前者会把后者整条遮住。
+# (b) fcntl(F_DUPFD) 直接把宿主 fd 号递回客户机，而客户机的 fd 表里没有这个号。
+#     dash 保存 stdout 用的正是它，于是 dup3 还原时 EBADF，stdout 永久留在
+#     重定向目标上：sh -c 'echo a; echo b > /dev/null; echo c' 只打印 a。
+echo "[10] glibc fork 与 fcntl F_DUPFD"
+CS_OUT=$("$SRC/mlc" sh -c 'echo $(echo SUBS_OK)' 2>/dev/null); CSRC=$?
+case "$CS_OUT" in
+    *SUBS_OK*) [ $CSRC -eq 0 ] && ok "命令替换 \$(...) 能 fork（clone 0x1200011）" || bad "命令替换输出对但退出码 ${CSRC}" ;;
+    *) bad "命令替换失败（退出码 ${CSRC}，输出 [$CS_OUT]）——clone 漏了 glibc 的 fork 标志" ;;
+esac
+PIPE_OUT=$("$SRC/mlc" sh -c 'echo p | cat' 2>/dev/null); PRC2=$?
+case "$PIPE_OUT" in
+    p) [ $PRC2 -eq 0 ] && ok "管道两侧都 fork 成功" || bad "管道退出码 ${PRC2}" ;;
+    *) bad "管道失败（退出码 ${PRC2}，输出 [$PIPE_OUT]）" ;;
+esac
+# 去牙实测（把 clone 的 is_fork 判据改回只认 0x0011）：前两条立刻变红
+RED_OUT=$("$SRC/mlc" sh -c 'echo a; echo b > /dev/null; echo c' 2>/dev/null); RRRC=$?
+case "$RED_OUT" in
+    a*c*) [ $RRRC -eq 0 ] && ok "重定向之后 stdout 被还原（fcntl F_DUPFD 建了客户机 fd）" || bad "重定向还原后退出码 ${RRRC}" ;;
+    *) bad "重定向后 stdout 没还原（退出码 ${RRRC}，输出 [$RED_OUT]）——F_DUPFD 返回的是宿主 fd 号" ;;
+esac
+# 反向：重定向必须真的生效，不能因为修还原就把重定向本身修没了
+SUP_OUT=$("$SRC/mlc" sh -c 'ls /definitely-not-here-xyz > /dev/null; echo "passed"' 2>/dev/null); SRC2=$?
+case "$SUP_OUT" in
+    passed) [ $SRC2 -eq 0 ] && ok "重定向本身仍生效（stdout 真的被换过）" || bad "重定向生效但退出码 ${SRC2}" ;;
+    *) bad "重定向没生效（退出码 ${SRC2}，输出 [$SUP_OUT]）" ;;
+esac
 
 echo
 echo "=== 结果: 通过 $PASS 项, 失败 $FAIL 项 ==="

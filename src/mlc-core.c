@@ -61,6 +61,18 @@
 #define SYS_clone         220   // 进程创建：glibc 的 posix_spawn 与 fork 都走这条
 #define SYS_execve        221   // 替换当前镜像
 #define SYS_wait4         260   // 等待子进程
+
+// ---------- Linux clone 标志（linux/sched.h） ----------
+#define CLONE_VM             0x00000100UL
+#define CLONE_FS             0x00000200UL
+#define CLONE_FILES          0x00000400UL
+#define CLONE_SIGHAND        0x00000800UL
+#define CLONE_VFORK          0x00004000UL
+#define CLONE_PARENT_SETTID  0x00100000UL
+#define CLONE_CHILD_CLEARTID 0x00200000UL
+#define CLONE_CHILD_SETTID   0x01000000UL
+#define CLONE_THREAD         0x00010000UL
+#define CLONE_SETTLS         0x00080000UL
 #define SYS_futex          98
 #define SYS_set_robust_list 99
 #define SYS_nanosleep     101
@@ -796,6 +808,12 @@ static int g_exec_argc;
 static char *g_exec_envp[GUEST_EXEC_ENVC_MAX];
 static int g_exec_envc;
 
+// CLONE_CHILD_CLEARTID 的簿记：子进程退出时必须把 child_tidptr 清成 0，
+// 否则 glibc 挂在那个地址上的 futex 永远等不到唤醒。execve 之后地址失效，
+// 因此 guest_state_reset 要一起清掉。
+static uint64_t g_exit_cleartid = 0;
+static int32_t  g_exit_cleartid_val = 0;
+
 // execve 之前的旧镜像簿记清理。只清必须清的，其余留给新加载覆盖。
 static void guest_state_reset(void) {
     // 目录句柄不跨 exec：先 closedir 再清表，否则 DIR* 与其内部 dup 的 fd 一起泄漏
@@ -828,6 +846,9 @@ static void guest_state_reset(void) {
     // 窗口游标回到两端，新镜像从低端重新 bump-up
     g_win_low = g_win_base;
     g_win_high = g_win_end;
+    // CLEARTID 地址属于旧镜像，exec 之后不能再碰
+    g_exit_cleartid = 0;
+    g_exit_cleartid_val = 0;
 }
 
 
@@ -1272,10 +1293,36 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     case SYS_fcntl: {
         int hfd = guest_fd_host((int)a0);
         if (hfd < 0) return -L_EBADF;
-        // 第三参数是否指针取决于 cmd，这里只对已知带指针的两个做校验
-        if ((a1 == 1 /*F_GETLK*/ || a1 == 2 /*F_SETLK*/) && !guest_ptr_ok(a2, 8)) return -L_EFAULT;
-        int r = fcntl(hfd, (int)a1, (void *)a2);
-        return r < 0 ? -errno : r;
+        // 命令号两侧不是同一套：Linux F_GETLK=5/F_SETLK=6/F_SETLKW=7、
+        // F_DUPFD_CLOEXEC=1030，宿主分别是 7/8/9 与 67。不翻译的话客户机要
+        // F_GETLK 会拿到宿主的 F_GETOWN，要 F_SETLK 会去改 socket owner，
+        // 而且全都"成功返回"——静默做错事比报错更难发现（2026-11-06 修）。
+        int cmd = (int)a1;
+        switch (cmd) {
+            case 5:    cmd = 7;  break;   // F_GETLK
+            case 6:    cmd = 8;  break;   // F_SETLK
+            case 7:    cmd = 9;  break;   // F_SETLKW
+            case 1030: cmd = 67; break;   // F_DUPFD_CLOEXEC
+            default: break;
+        }
+        // 带指针的那几个要校验，否则客户机给个野指针就写穿宿主内存
+        if ((cmd == 7 /*宿主 F_GETLK*/ || cmd == 8 /*F_SETLK*/ || cmd == 9 /*F_SETLKW*/)
+            && !guest_ptr_ok(a2, sizeof(struct flock))) return -L_EFAULT;
+        // F_DUPFD / F_DUPFD_CLOEXEC：宿主返回的是宿主 fd 号，客户机认的是自己
+        // 的 fd 表。原来直接把宿主号递回去，客户机会拿到一个从未登记过的 fd，
+        // 之后对它的任何操作都是 EBADF。dash 保存 stdout 再还原正是这条路：
+        //   fcntl(1, F_DUPFD, 10) -> 10，fcntl(10, F_GETFD) -> EBADF，
+        //   dup3(10, 1, 0) -> EBADF，于是 stdout 永远停在重定向目标上。
+        // 实测症状：sh -c 'echo a; echo b > /dev/null; echo c' 只打印 a。
+        int is_dup = (cmd == 0 || cmd == 67);
+        int r = fcntl(hfd, cmd, (void *)a2);
+        if (r < 0) return -errno;
+        if (is_dup) {
+            int g = guest_fd_alloc(r);
+            if (g < 0) { close(r); return -L_EMFILE_; }
+            return g;
+        }
+        return r;
     }
     case SYS_brk: {
         if (!a0) return (int64_t)g_brk_cur;
@@ -1423,6 +1470,13 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
                     (unsigned long long)g_guest_tp_good, g_tp_fixups);
         }
         fflush(NULL);
+        // CLONE_CHILD_CLEARTID：退出前把 child_tidptr 清成 0（Linux 内核语义）。
+        // 只在与当初记下的值一致时才写，避免清掉别人后来写进去的东西。
+        if (g_exit_cleartid && guest_ptr_ok(g_exit_cleartid, 4)) {
+            if (*(int32_t *)g_exit_cleartid == g_exit_cleartid_val)
+                *(int32_t *)g_exit_cleartid = 0;
+            g_exit_cleartid = 0;
+        }
         _exit((int)a0);
     }
     case SYS_getpid:        return getpid();
@@ -1450,15 +1504,24 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     }
     case SYS_set_robust_list: return 0;
     case SYS_clone: {
-        // B7：客户机创建进程。只支持两类用法，其余一律 ENOSYS（宁可诚实失败，
+        // B7：客户机创建进程。只支持进程级用法，其余一律 ENOSYS（宁可诚实失败，
         // 也不要给出一个语义不符的成功）：
-        //   a0 = 0x4111 = CLONE_VM|CLONE_VFORK|SIGCHLD —— glibc posix_spawn
-        //   a0 = 0x0011 = SIGCHLD                      —— glibc fork()
+        //   a0 = 0x4111   = CLONE_VM|CLONE_VFORK|SIGCHLD     —— glibc posix_spawn
+        //   a0 = 0x0011   = SIGCHLD                          —— 裸 fork
+        //   a0 = 0x1200011= SIGCHLD|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID
+        //                 —— glibc 2.39 真正的 fork()。**这一条以前漏了**，
+        //                 于是 dash 的命令替换 $(...)、反引号、管道、以及任何
+        //                 带重定向的外部命令全都报 Cannot fork（退出码 2）。
+        //                 它们与 posix_spawn 走的是两条不同的 clone 调用。
         // 其它带 CLONE_THREAD/CLONE_SETTLS/CLONE_NEWNS 等位的用法属多线程与命名
         // 空间，归 M3，当前没有实现也不假报成功。
         unsigned long flags = (unsigned long)a0;
-        int is_spawn = (flags == 0x4111UL);
-        int is_fork  = (flags == 0x0011UL) || (flags == 0x0000UL);
+        // 信号位：Linux 把退出信号放在 flags 的 bit 0-6，这里只接受 SIGCHLD(17)
+        unsigned long sigbits = flags & 0xffUL;
+        unsigned long rest   = flags & ~(0xffUL);
+        int is_spawn = (flags == (CLONE_VM | CLONE_VFORK | 17UL));
+        int is_fork  = (rest == 0UL && sigbits == 17UL)
+                    || (rest == (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) && sigbits == 17UL);
         if (!is_spawn && !is_fork) {
             fprintf(stderr, "[mlc] clone：不支持的标志 0x%lx，返回 ENOSYS（多线程归 M3）\n", flags);
             return -L_ENOSYS;
@@ -1466,14 +1529,28 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         // 父进程的蹦桌池此时可能停在「可写」状态（某次 patch_svc_in_range 异常
         // 返回），fork 之前先收尾成只读可执行，子进程才不会踩到半写状态。
         tp_finish_write();
+        // CLONE_PARENT_SETTID 要求子进程把自己的 TID 写进 child_tidptr（a3）
+        int do_child_settid = (flags & CLONE_PARENT_SETTID) && a3
+                              && guest_ptr_ok(a3, 4);
+        // CLONE_CHILD_CLEARTID 要求子进程退出时把 child_tidptr 清成 0
+        int do_cleartid = (flags & CLONE_CHILD_CLEARTID) && a3
+                          && guest_ptr_ok(a3, 4);
         pid_t pid = fork();
         if (pid < 0) return -errno;
         if (pid == 0) {
             // 子进程：诊断计数从零开始，蹦桌簿记按写时复制的现状继续用
             g_sc_total = 0;
             for (int i = 0; i < 512; i++) g_sc_by_nr[i] = 0;
+            if (do_child_settid) *(int32_t *)a3 = (int32_t)getpid();
+            if (do_cleartid) {
+                g_exit_cleartid = (uint64_t)a3;
+                g_exit_cleartid_val = *(int32_t *)a3;
+            }
             return 0;
         }
+        // CLONE_CHILD_SETTID 要求父进程把子进程 TID 写进 parent_tidptr（a2）
+        if ((flags & CLONE_CHILD_SETTID) && a2 && guest_ptr_ok(a2, 4))
+            *(int32_t *)a2 = (int32_t)pid;
         return (int64_t)pid;
     }
     case SYS_wait4: {

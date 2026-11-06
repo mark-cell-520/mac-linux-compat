@@ -3,14 +3,15 @@
 macOS 上的 Linux 兼容层。不做虚拟机，用用户态翻译在 macOS ARM64 上直接运行 Linux ARM64 程序。
 思路与 CrossOver/Wine 同构：客户机指令原生执行，Linux 系统调用在本进程内翻译成 macOS 调用。
 
-## 现状（2026-11-06，v1.6）
+## 现状（2026-11-06，v1.6.1）
 
 能跑：Ubuntu Base 24.04.5 ARM64 的真实动态 PIE 可执行文件。
 实测通过：`ls`、`ls -la /`、`cat`、`echo`、`sh -c`（内建命令与外部命令）、
+命令替换 `$(...)` 与反引号、管道、shell 重定向（含重定向之后 fd 正确还原）、
 完整的 ld.so → libc → libselinux → libpcre2 动态链接链、locale/gconv 初始化、
 `statx/newfstatat/lstat` 权限与符号链接、`getdents64` 目录列举、
 客户机退出码原样透传、fork/exec/wait4（外部命令经 sh 执行）。
-已验证约 60 个系统调用；tests/verify.sh 三十二项全过（十一项静态载荷 + 四项动态链接冒烟 + 十项审计回归 + 一项寄存器保存回归 + 一项线程指针回归 + 三项 fork/exec + 四项 newfstatat）。
+已验证约 60 个系统调用；tests/verify.sh 三十八项全过（十一项静态载荷 + 四项动态链接冒烟 + 十项审计回归 + 一项寄存器保存回归 + 一项线程指针回归 + 三项 fork/exec + 四项 newfstatat + 两项安装路径 + 四项 glibc fork 与 fcntl）。
 不能跑：多线程、真实信号投递、网络、非 PIE 镜像
 （见 docs/10-整改清单.md 的 M2/M3 段）。
 已知缺陷：
@@ -24,6 +25,43 @@ macOS 上的 Linux 兼容层。不做虚拟机，用用户态翻译在 macOS ARM
   mlc-core 就复现。量化用 `bash tests/stability.sh`。
 
 v1.6 在 v1.5 的基础上打通 fork/exec（B7），外部命令从此能经 sh 跑起来。
+
+v1.6.1 修掉四个"门禁全绿但产品不可用"的缺陷（F60-F63）。它们不是审计也不是
+压测找到的，是用户按本文档装好之后真的去用，几分钟内撞出来的。共同点：38 项
+验证全绿，因为每一项都只在项目目录里直接调 src/mlc——装到别处之后的路、以及
+"真的写个脚本"会用到的路，一条都没被测过。教训一句话：在项目目录里跑绿的门禁，
+证明不了装到别处之后还能用。四点：
+
+1. 拷到 `~/.local/bin/mlc` 之后找不到项目根（F60）。`src/mlc` 原先用「脚本
+   上一级」当项目根，拷走之后上一级变成 `~/.local`，CORE 算成
+   `~/.local/src/mlc-core`，一运行就退 127。改成三级定位：环境变量
+   `MLC_HOME` > 安装时写死的 `INSTALL_HOME` > 脚本相对位置；两个安装脚本
+   拷过去之后用 sed 把真实项目根写进 `INSTALL_HOME` 并 grep 校验写成功了。
+   顺带修掉报错句里的全角逗号——`$CORE，` 会被 bash 3.2 解析成变量 `CORE，`，
+   `set -u` 直接让脚本死掉，用户看到的是一句乱码而不是"没找到核心"。
+   这个坑在本项目已第三次出现。
+2. clone 漏了 glibc 真正的 fork()（F61）。客户机创建进程有两条不同的 clone
+   调用：posix_spawn 用 `CLONE_VM|CLONE_VFORK|SIGCHLD`（实测 a0=0x4111），
+   而真正的 fork() 用 `SIGCHLD|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID`
+   （0x1200011）。实现只认前一条，于是 dash 的命令替换 `$(...)`、反引号、
+   管道、以及任何带重定向的外部命令全都报 `Cannot fork`、退出码 2。
+   v1.6 的 fork/exec 三项回归没抓到，是因为它测的
+   `sh -c '/usr/bin/echo ...'` 走 posix_spawn；而 dash 的最后一个命令优化
+   又让 `sh -c 'ls /'` 不 fork 也能跑，于是连"外部命令能跑"都没露馅。
+3. fcntl(F_DUPFD) 把宿主 fd 号递回客户机（F62）。宿主返回值是宿主 fd 号，
+   客户机认的是自己的 fd 表，直接递回去就等于给了一个从未登记过的 fd。dash
+   保存 stdout 正是 `fcntl(1, F_DUPFD, 10)`、还原是 `dup3(10, 1, 0)`，第二次
+   调用时 EBADF，stdout 就永久停在重定向目标上——
+   `sh -c 'echo a; echo b > /dev/null; echo c'` 只打印 a。
+   改成结果走 guest_fd_alloc 登记成客户机 fd。
+4. fcntl 命令号两侧不是同一套（F63）。Linux `F_GETLK=5/F_SETLK=6/F_SETLKW=7/
+   F_DUPFD_CLOEXEC=1030`，宿主是 `7/8/9/67`。原来不翻译，而且校验指针时用的
+   常量写的是 F_GETFD/F_SETFD——野指针校验一次都没生效过。加了一张翻译表。
+
+回归：verify.sh 32 → 38 项，新增第 [9] 段两项（拷贝后能跑、MLC_HOME 优先）与
+第 [10] 段四项（命令替换、管道、重定向后 stdout 被还原、重定向本身仍生效）。
+两组都做了去牙实测。稳定性：stability.sh 60 轮 0 崩溃 0 挂起；fork 加重定向
+混合 120 轮 0 失败。
 
 v1.5 那轮做的是把缺陷 K1 打到归零，做法与证据见 docs/08 的 F55/F56 与
 docs/10 的 K1 节，这里不重复。v1.6 的五点：
@@ -68,7 +106,7 @@ st_mode 为 0 时所有找到的可执行文件都被判成「非常规文件」
 ## 一键安装
 
 双击 `MLC.command`（Finder 里右键→打开，或直接双击）。
-脚本依次做：检查 arm64 + clang → 解包 rootfs → 构建 src/mlc-core → 跑 32 项验证 →
+脚本依次做：检查 arm64 + clang → 解包 rootfs → 构建 src/mlc-core → 跑 38 项验证 →
 把 `mlc` 命令拷到 `~/.local/bin`。不装 Homebrew、不改系统配置、不留服务。
 卸载：删掉项目目录与 `~/.local/bin/mlc`，无残留。
 
@@ -89,13 +127,23 @@ mlc ls -la /                 # 列 rootfs 根目录
 mlc cat /etc/hostname        # 读 rootfs 里的文件
 mlc --list                   # rootfs 里可运行的程序清单
 mlc sh -c 'echo hi'          # 跑 sh（内建命令）
-mlc sh -c 'ls /'            # 跑 sh 里的外部命令（fork/exec）
-bash tests/verify.sh         # 三十二项验证
+mlc sh -c 'ls /'             # 跑 sh 里的外部命令（fork/exec）
+mlc sh -c 'echo $(uname -s)' # 命令替换（glibc fork）
+mlc sh -c 'ls / | wc -l'     # 管道
+mlc sh -c 'ls / > /dev/null; echo after'   # 重定向之后 fd 会还原
+bash tests/verify.sh         # 三十八项验证
 bash tests/stability.sh 200  # 偶发失败率观测（只报告，不作门禁）
 ```
 
+诊断信息全部走 stderr，所以 `mlc ls > out.txt` 拿到的是干净输出；
+想看加载与系统调用过程就加 `MLC_DEBUG=1`。
+
 `mlc` 与直接调 `src/mlc-core` 的关系：`mlc` 负责在 rootfs 里按客户机 PATH 找程序、
 透传参数、原样返回退出码；翻译器本体仍是 `src/mlc-core`。
+
+如果 `mlc` 被拷到了别处（安装脚本正是这么做的），它靠写在脚本里的
+`INSTALL_HOME` 找回项目根；也可以用环境变量覆盖：
+`MLC_HOME=/路径/mac-linux-compat mlc ls`。
 
 路径语义：客户机的绝对路径（`/etc/hostname`）重写进 `rootfs/sysroot`；
 相对路径与 `.` 用宿主当前目录，因此 `mlc ls` 列的是你所在目录的真实文件。
@@ -129,11 +177,17 @@ bash tests/stability.sh 200  # 偶发失败率观测（只报告，不作门禁�
    这三个数原先没有上界，客户机参数可以直接踩宿主栈（F37）。
    auxv 的 AT_PAGESZ 报宿主真实页大小 16384——报 4096 会让 glibc 的段对齐
    与宿主页粒度错位，把同页内相邻映射的数据抹掉（F35）。
-6. fork/exec 三条路（v1.6）。clone 只认 posix_spawn 的 CLONE_VM|CLONE_VFORK|
-   SIGCHLD 与裸 fork 的 SIGCHLD，落到宿主 fork()，其余带 CLONE_THREAD 等位的
-   一律 ENOSYS。execve 记下路径与 argv/envp（字符串抄进宿主缓冲区，旧客户机栈
-   会被新镜像盖掉）后 longjmp 回 main 的加载循环，重新加载镜像、重建客户机栈、
-   再跳一次入口。wait4 走 waitpid 并把状态编码翻成 Linux 形态。
+6. fork/exec 三条路（v1.6）。clone 认三种进程级用法：posix_spawn 的
+   CLONE_VM|CLONE_VFORK|SIGCHLD（0x4111）、裸 fork 的 SIGCHLD（0x0011）、
+   以及 glibc 真正的 fork() 的 SIGCHLD|CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID
+   （0x1200011）——最后这条 v1.6 漏了，命令替换与管道因此全废，v1.6.1 补上。
+   三种都落到宿主 fork()，并分别实现 CLONE_CHILD_SETTID（父进程把子 TID 写进
+   parent_tidptr）、CLONE_PARENT_SETTID（子进程写 child_tidptr）、
+   CLONE_CHILD_CLEARTID（退出时清零）。其余带 CLONE_THREAD/CLONE_SETTLS 等位的
+   一律 ENOSYS——多线程归 M3，不给语义不符的成功。
+   execve 记下路径与 argv/envp（字符串抄进宿主缓冲区，旧客户机栈会被新镜像
+   盖掉）后 longjmp 回 main 的加载循环，重新加载镜像、重建客户机栈、再跳一次
+   入口。wait4 走 waitpid 并把状态编码翻成 Linux 形态。
    execve 保留 fd 表，区域表/guard 表/镜像表/brk 区/蹦桌池全部重建。
 
 ## 目录
@@ -145,7 +199,7 @@ bash tests/stability.sh 200  # 偶发失败率观测（只报告，不作门禁�
 - src/mlc 命令行入口（PATH 查找 + 退出码透传）
 - src/install.sh 手动安装（等价于 MLC.command）
 - scripts/unpack-rootfs.sh 按需解出 103MB 的 sysroot
-- tests/ 测试载荷生成器（mkelf.py 迷你链接器 + test.s + regs.s + tp.s）、验证脚本（32 项）、稳定性观测
+- tests/ 测试载荷生成器（mkelf.py 迷你链接器 + test.s + regs.s + tp.s）、验证脚本（38 项）、稳定性观测
 - rootfs/ubuntu-base-arm64.tar.gz Ubuntu Base 24.04.5 ARM64（29MB，解压后约 103MB）
 - docs/ 十份生命周期文档：调研、准备、计划、执行、验证、审计、安全、修复、落地、整改
 

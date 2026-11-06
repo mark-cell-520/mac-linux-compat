@@ -40,6 +40,12 @@ log "安装 mlc 命令到 $BIN_DIR ..."
 mkdir -p "$BIN_DIR" || die "无法创建 $BIN_DIR"
 cp "$SRC/mlc" "$BIN_DIR/mlc" || die "拷贝失败"
 chmod +x "$BIN_DIR/mlc"
+# 把真实项目根写进 INSTALL_HOME。不写的话拷贝过去的 mlc 会用"脚本上一级"
+# 当项目根，算出 ~/.local/src/mlc-core 这种不存在的路径，一运行就退 127。
+# 这条路径以前从没被走过：安装完都是直接在项目里调 src/mlc（2026-11-06 修）
+sed -i '' "s|^INSTALL_HOME=\"\"|INSTALL_HOME=\"$MLC_HOME\"|" "$BIN_DIR/mlc" || die "写入项目根失败"
+grep -q "^INSTALL_HOME=\"$MLC_HOME\"" "$BIN_DIR/mlc" || die "项目根未写进 ${BIN_DIR}/mlc"
+log "已在 mlc 里记录项目根：$MLC_HOME"
 
 # 6. PATH 提示
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
@@ -53,7 +59,7 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
         log "$SHELL_RC 里已有 ~/.local/bin，重开终端即可生效"
     else
         printf '\n# MLC（mac-linux-compat）\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$SHELL_RC"
-        log "已把 ~/.local/bin 写进 $SHELL_RC，重开终端即可生效"
+        log "已把 ~/.local/bin 写进 ${SHELL_RC}，重开终端即可生效"
         log "当前终端可先执行：export PATH=\"\$HOME/.local/bin:\$PATH\""
     fi
 fi
@@ -65,8 +71,9 @@ log "  mlc cat /etc/hostname        读 rootfs 里的文件"
 log "  mlc --list                   看 rootfs 里有哪些程序"
 log "  mlc sh -c 'echo hi'          跑 sh"
 log "rootfs 位置：$MLC_HOME/rootfs/sysroot（Ubuntu Base 24.04.5 ARM64）"
-log "已知边界：多线程、真实信号投递、fork/exec 尚未实现；动态链接错误路径有约 2% 偶发失败"
-log "          （缺陷 K1，见 docs/10-整改清单.md；复现与观测用 bash tests/stability.sh）"
+log "卸载：删掉 $MLC_HOME 与 $BIN_DIR/mlc，无残留"
+log "已知边界：多线程、真实信号投递、网络、非 PIE 镜像尚未实现"
+log "          偶发失败率与已知缺陷见 docs/09-风险登记表.md 与 docs/10-整改清单.md"
 echo
 echo "按回车键关闭窗口..."
 read -r
