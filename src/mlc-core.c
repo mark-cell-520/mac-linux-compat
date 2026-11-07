@@ -1321,6 +1321,63 @@ static void fill_utsname(l_utsname_t *u) {
 }
 
 // ---------- 系统调用分发 ----------
+// K2 排查：记录客户机系统调用号序列的前 SC_SEQ_MAX 个。之所以需要它：
+// 失败轮与成功轮在退出时刻的所有符号查找结构（link_map 链、scope、
+// l_versions、libc 的 bloom/buckets/chain、.gnu.version、.dynsym 项）逐项
+// 完全相同，说明差异不在最终状态而在过程里。系统调用序列是过程的可观测投影，
+// 两轮序列第一次分叉的地方，就是根因所在。
+#define SC_SEQ_MAX 600
+static int g_sc_seq[SC_SEQ_MAX];
+static int g_sc_seq_n = 0;
+static int g_sc_trace = -1;
+
+// K2 排查：把一个客户机地址归到引擎登记过的镜像上（主程序与 ld.so）。
+// 库是 ld.so 自己 mmap 进来的，引擎只把它们记在区域表里，不在 g_img 里，
+// 所以回溯对库内地址只能给出原始值，事后用 tests/mlc-k2-*.py 对照 dump 定位。
+static const char *mlc_img_of(uint64_t a, uint64_t *off) {
+    for (int i = 0; i < g_nimg; i++) {
+        if (a >= g_img[i].base && a < g_img[i].base + g_img[i].span) {
+            *off = a - g_img[i].base;
+            return g_img[i].name;
+        }
+    }
+    return NULL;
+}
+
+// K2 排查：客户机打出 "symbol lookup error" 的那一刻，把此刻的客户机调用链
+// 原样印出来。之所以需要它：失败轮与成功轮在退出时刻的内存状态（link_map 链、
+// scope、l_versions、libc 的 bloom/buckets/chain、.gnu.version、.dynsym 项）
+// 逐项比对完全相同，也就是说差异不在最终状态里，而在到达查找之前的调用路径上。
+// 只有栈上的返回地址能告诉我们 ld.so 是从哪条路走到 _dl_fatal_printf 的。
+// 保存块布局见 ML_STUB：x0-x29 在 regs[0..29]，x30 在 regs[30]。
+static void mlc_dump_guest_backtrace(uint64_t *regs) {
+    fprintf(stderr, "[mlc][回溯] 客户机报 symbol lookup error，此刻调用链：\n");
+    uint64_t lr = regs[30];
+    if (lr) {
+        uint64_t off;
+        const char *nm = mlc_img_of(lr, &off);
+        fprintf(stderr, "  lr   0x%llx %s%s%llx\n", (unsigned long long)lr,
+                nm ? nm : "(库)", nm ? "+0x" : "", (unsigned long long)off);
+    }
+    uint64_t fp = regs[29];
+    for (int i = 0; i < 32 && fp; i++) {
+        if (!region_covers(fp, fp + 16)) {
+            fprintf(stderr, "  fp[%d] 0x%llx 不可读，链断\n", i, (unsigned long long)fp);
+            break;
+        }
+        uint64_t saved_fp = *(uint64_t *)(uintptr_t)fp;
+        uint64_t ret = *(uint64_t *)(uintptr_t)(fp + 8);
+        uint64_t off;
+        const char *nm = mlc_img_of(ret, &off);
+        fprintf(stderr, "  fp[%d] 0x%llx -> 0x%llx %s%s%llx\n", i,
+                (unsigned long long)fp, (unsigned long long)ret,
+                nm ? nm : "(库)", nm ? "+0x" : "", (unsigned long long)off);
+        if (saved_fp <= fp) break;
+        fp = saved_fp;
+    }
+    fflush(NULL);
+}
+
 static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     uint64_t nr = regs[REG_X8];
     uint64_t a0 = regs[0], a1 = regs[1], a2 = regs[2], a3 = regs[3], a4 = regs[4], a5 = regs[5];
@@ -1332,6 +1389,10 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         if (hfd < 0) return -L_EBADF;
         if (nr == SYS_write) {
             if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+            // K2 排查：客户机报 symbol lookup error 时抓调用链（见 mlc_dump_guest_backtrace）。
+            if (a2 > 32 && a2 <= GUEST_IO_MAX &&
+                memmem((const void *)(uintptr_t)a1, (size_t)a2, "symbol lookup error", 19))
+                mlc_dump_guest_backtrace(regs);
             ssize_t r = write(hfd, (const void *)a1, (size_t)a2);
             return r < 0 ? -errno : r;
         } else {
@@ -1339,10 +1400,19 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
             uint64_t cnt = a2;
             if (!guest_ptr_ok(a1, cnt * 16)) return -L_EFAULT;
             ssize_t total = 0;
+            // K2 排查：ld.so 的 _dl_fatal_printf 实测走 writev 而不是 write，
+            // 所以错误信息要在这里逐段找。分两种情况都查：整段里含关键串，
+            // 或者某段以 "undefined symbol:" 开头（错误信息被拆成多段时）。
             for (uint64_t i = 0; i < cnt; i++) {
                 uint64_t base = *(uint64_t *)(a1 + i * 16);
                 uint64_t len  = *(uint64_t *)(a1 + i * 16 + 8);
                 if (!guest_ptr_ok(base, len > GUEST_IO_MAX ? 0 : len)) return -L_EFAULT;
+                if (len > 32 && len <= GUEST_IO_MAX) {
+                    const void *p = (const void *)(uintptr_t)base;
+                    if (memmem(p, (size_t)len, "symbol lookup error", 19) ||
+                        memmem(p, (size_t)len, "undefined symbol:", 17))
+                        mlc_dump_guest_backtrace(regs);
+                }
                 ssize_t r = write(hfd, (const void *)base, (size_t)len);
                 if (r < 0) return total ? total : -errno;
                 total += r;
@@ -1790,12 +1860,62 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
                     snprintf(op, sizeof(op), "%s/reg%02d.bin", dd, i);
                     FILE *fo = fopen(op, "wb");
                     if (!fo) continue;
-                    fwrite((void *)(uintptr_t)rs, 1, (size_t)(re - rs), fo);
+                    // K2 排查：区间里可能有页根本不可读。宿主页 16K 而客户机页 4K，
+                    // mprotect 按宿主页对齐时会把多出来的 12K 一并设成 PROT_NONE——
+                    // 客户机的 .dynsym 一类元数据若恰好落在这 12K 里，符号查找就会
+                    // 「表在但读不到」。先用 mach_vm_read_overwrite 逐页问可读性
+                    // （它不会因读不可读内存而触发 SIGSEGV），读得出的写原文，
+                    // 读不出的补 0xFF，并把不可读范围打到日志。
+                    // 之所以不能直接 fwrite 整段：读到不可读页会 SIGSEGV，
+                    // 而信号处理器入口的 SIG_DFL 兜底会让进程当场死掉，
+                    // 转储就停在半路。
+                    uint64_t badstart = 0, badend = 0, badcnt = 0;
+                    for (uint64_t a = rs; a < re; a += 0x4000) {
+                        uint64_t n = (a + 0x4000 <= re) ? 0x4000 : (re - a);
+                        static char tmp[0x4000];
+                        memset(tmp, 0xFF, (size_t)n);
+                        mach_vm_size_t got = 0;
+                        kern_return_t kr = mach_vm_read_overwrite(
+                            mach_task_self(), (vm_address_t)a, (mach_vm_size_t)n,
+                            (vm_address_t)tmp, &got);
+                        if (kr == KERN_SUCCESS && got == n) {
+                            fwrite(tmp, 1, (size_t)n, fo);
+                            continue;
+                        }
+                        // 整页读不进来：逐字问，能读的读，不能的保持 0xFF
+                        if (!badstart) badstart = a;
+                        badend = a + n;
+                        badcnt++;
+                        for (uint64_t k = 0; k < n; k++) {
+                            mach_vm_size_t g1 = 0;
+                            if (mach_vm_read_overwrite(mach_task_self(),
+                                    (vm_address_t)(a + k), 1,
+                                    (vm_address_t)(tmp + k), &g1) != KERN_SUCCESS)
+                                tmp[k] = (char)0xFF;
+                        }
+                        fwrite(tmp, 1, (size_t)n, fo);
+                    }
                     fclose(fo);
-                    fprintf(stderr, "[mlc][转储] 区域 %d [0x%llx,0x%llx) -> %s\n",
-                            i, (unsigned long long)rs, (unsigned long long)re, op);
+                    if (badstart)
+                        fprintf(stderr, "[mlc][转储] 区域 %d [0x%llx,0x%llx) -> %s，"
+                                "其中 %d 个 16K 页不可读，首末 0x%llx-0x%llx（已用 0xFF 补齐）\n",
+                                i, (unsigned long long)rs, (unsigned long long)re, op,
+                                (int)badcnt, (unsigned long long)badstart,
+                                (unsigned long long)badend);
+                    else
+                        fprintf(stderr, "[mlc][转储] 区域 %d [0x%llx,0x%llx) -> %s\n",
+                                i, (unsigned long long)rs, (unsigned long long)re, op);
                 }
             }
+        // K2 排查：系统调用序列的前 SC_SEQ_MAX 个。放在 MLC_DEBUG 块外：
+        // MLC_DEBUG 本身会改变 K2 的失败率，拿它当开关就分不清是打印的影响
+        // 还是序列本身的关系。与成功轮对比，第一次分叉处即根因所在。
+        if (g_sc_trace) {
+            fprintf(stderr, "[mlc][诊断] 系统调用序列（%d 个）：", g_sc_seq_n);
+            for (int k = 0; k < g_sc_seq_n; k++)
+                fprintf(stderr, "%s%d", k ? "," : "", g_sc_seq[k]);
+            fprintf(stderr, "\n");
+        }
         fflush(NULL);
         // CLONE_CHILD_CLEARTID：退出前把 child_tidptr 清成 0（Linux 内核语义）。
         // 只在与当初记下的值一致时才写，避免清掉别人后来写进去的东西。
@@ -2368,6 +2488,11 @@ static image_t *load_image(const char *path) { return load_image2(path, 0); }
 static int64_t mlc_syscall_handler(uint64_t *regs) {
     g_sc_total++;
     if (regs[REG_X8] < 512) g_sc_by_nr[regs[REG_X8]]++;
+    if (g_sc_trace < 0) {
+        const char *e = getenv("MLC_SC_TRACE");
+        g_sc_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (g_sc_trace && g_sc_seq_n < SC_SEQ_MAX) g_sc_seq[g_sc_seq_n++] = (int)regs[REG_X8];
     // 兼记有效客户机 TCB：msr TPIDR_EL0 写入点已由 mlc_tp_write_probe 记录，
     // 这里再兜一层——万一将来有别的路径设了线程指针（或写入点漏拦），
     // 顶替时手里仍有可用的值。判据与 TP_PLAUSIBLE_MIN 相同。

@@ -22,7 +22,7 @@ def load(dump, errlog):
     regs = []
     with open(errlog) as f:
         for line in f:
-            m = re.search(r"区域 (\d+) \[(0x[0-9a-f]+),(0x[0-9a-f]+)\) -> (\S+)", line)
+            m = re.search(r"区域 (\d+) \[(0x[0-9a-f]+),(0x[0-9a-f]+)\) -> ([^\s，]+)", line)
             if not m:
                 continue
             i = int(m.group(1))
