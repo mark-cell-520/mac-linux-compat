@@ -7,9 +7,12 @@ src/probe1
 tests/test.elf
 tests/regs.elf
 tests/tp.elf
+tests/poll.elf
 tests/regs.s.o
 tests/.audit*.err
 tests/.trace.err
+tests/.build.err
+tests/.fakebin
 .DS_Store
 
 # rootfs 解压产物：仓库里只放 29MB 的 tarball，解压出来的 103MB 不入库。

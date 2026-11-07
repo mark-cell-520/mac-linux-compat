@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <setjmp.h>
 #include <sys/wait.h>
+#include <poll.h>        // 第七轮补 ppoll/poll（ripgrep 启动即发 nr=73）
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
@@ -80,6 +81,9 @@
 #define SYS_nanosleep     101
 #define SYS_clock_gettime 113
 #define SYS_clock_nanosleep 115
+// asm-generic 7 = poll、73 = ppoll。第七轮试用 ripgrep 15.2.0 时它启动即发 73。
+#define SYS_poll            7
+#define SYS_ppoll          73
 #define SYS_kill          129
 #define SYS_tgkill        131
 #define SYS_getpid        172
@@ -145,7 +149,20 @@
 #define SYS_sendmsg       211
 #define SYS_recvmsg       212
 #define SYS_gettimeofday  169
-#define SYS_sigaltstack   43   // glibc 早期初始化会调它；曾返回 ENOSYS，见 F46
+// asm-generic 132 才是 sigaltstack。2026-11-07 第七轮修正：原先这里写 43，
+// 而 43 是 statfs64——也就是说这个分支**从来没有被触发过**，F46 那次「补上实现
+// 后三百次零复现」是安慰剂修复：客户机（glibc 的 nptl 初始化）每次查询信号栈
+// 发的都是 132，一直落到 default 拿 ENOSYS，正是 F46 想消除的那个条件。
+// 证据：ripgrep 15.2.0 一启动就发 nr=132 (a0=0 a1=<栈地址> a2=0)，
+// 形状正是 sigaltstack(NULL, &old_ss) 的查询调用。同一条链上 129 kill、
+// 131 tgkill、134 rt_sigaction 都与既有定义吻合。
+#define SYS_sigaltstack  132
+// 43 是 statfs64，不是 sigaltstack。**刻意不实现**：客户机发 43 时落到 default
+// 拿 ENOSYS，这是当前既定行为，没有任何客户机实测发过它。
+// 留着这个定义只为把两个号分开，别再把它们混成一个分支——但要注意它没有对应
+// case，读代码时不要以为 43 号被处理过。已同步补进 mlc_sc_name，诊断链里
+// 能按名字显示，不会显示成空。
+#define SYS_statfs64      43
 
 // macOS SDK 无 sys/sysmacros.h：statx 需要的主次设备号宏
 #define major(x) ((int)(((unsigned)(x) >> 24) & 0xff))
@@ -173,6 +190,16 @@
 #define L_EAFNOSUPPORT 97
 #define L_EMFILE_  24
 #define L_ENOTDIR 20
+
+// AT_FDCWD 判定。审计修正（2026-11-07）：同一个文件里这个比较原本写了两种——
+// 1958 与 2613 用 a0 == (uint64_t)-100（正确），1986 与 2587 用裸 a0 == -100。
+// a0 是 uint64_t，裸 -100 会先提升成 uint64_t 再比，编译器为此告警
+// （-Wsign-compare）；两种写法并存，读代码的人无法判断哪一种是本意。
+// 这里统一按「低 32 位的有符号值」判定：客户机经 AAPCS64 传 int 实参时
+// x0 高 32 位是否清零取决于客户机指令，而同一批表达式里取 fd 用的都是
+// (int)a0，口径必须一致，否则会出现「高 32 位被清零时 AT_FDCWD 分支不命中、
+// 落到 guest_fd_host((int)a0) 拿 -1 再回 EBADF」这种只在特定客户机上现形的错。
+#define A0_IS_AT_FDCWD(a0)  ((int32_t)(uint32_t)(a0) == -100)
 #define L_ENAMETOOLONG_ 36
 
 // ---------- Linux 打开标志（asm-generic/fcntl.h） ----------
@@ -414,6 +441,18 @@ static int guest_str_ok(uint64_t p, uint64_t maxlen) {
 
 // 单次 I/O 的长度上限：防止客户机给个天文数字让宿主操作异常
 #define GUEST_IO_MAX (1ULL << 30)
+
+// 客户机 I/O 缓冲区校验。审计修正（2026-11-07）：read/write/readv/writev/
+// pread64/pwrite64 七个调用点原先都写成
+//     guest_ptr_ok(buf, len > GUEST_IO_MAX ? 0 : len)
+// 超大请求把 len 传成 0，而 guest_ptr_ok 对 len==0 只校验首字节就返回成功，
+// 紧接着却 read/write 整个 len 字节——超过 1GB 的请求等于拿一个几乎没校验过的
+// 客户机指针直接读写宿主内存。原来那个三元表达式想表达的正是「超大就拒」，
+// 但它把「拒」写成了「放过」。统一收敛到这一个函数，超大一律判非法。
+static int guest_io_ptr_ok(uint64_t p, uint64_t len) {
+    if (len > GUEST_IO_MAX) return 0;
+    return guest_ptr_ok(p, len);
+}
 
 // ---------- getdents64 的目录句柄表（v1.1 M2：close 联动 + 加锁）----------
 // 宿主目录流由 fdopendir 维护偏移，必须挂在 guest fd 上，
@@ -1536,15 +1575,29 @@ static const char *mlc_sc_name(uint64_t nr) {
     case 177: return "getegid";        case 214: return "brk";
     case 215: return "munmap";         case 222: return "mmap";
     case 226: return "mprotect";       case 261: return "prlimit64";
-    case 293: return "rseq";           default: return "";
+    case 293: return "rseq";
+    // 2026-11-07 审计补：第七轮修 sigaltstack 时把 43 与 132 分清，顺手把
+    // 这两个号加进名称表。没有它们，诊断链里这两行会显示成空，整段调用序列是断的。
+    case 43:  return "statfs64(未实现)";
+    case 132: return "sigaltstack";
+    default: return "";
     }
 }
 static void mlc_dump_sc_args(const char *tag) {
     if (!g_sc_args) return;
     fprintf(stderr, "[mlc][诊断] %s：带参数的系统调用（%d 个）\n", tag, g_sc_seq_n);
     for (int k = 0; k < g_sc_seq_n; k++) {
-        const char *nm = mlc_sc_name((uint64_t)g_sc_seq[k].nr);
-        if (!nm) continue;
+        const char *nm0 = mlc_sc_name((uint64_t)g_sc_seq[k].nr);
+        // 名字表里没有的 nr 也要能看见，否则整段调用链是断的——第七轮排查
+        // ppoll 断链时，前面 71 项全是认识的名字，第 72 项显示成空白，
+        // 一眼看不出「断在这儿」。这一支不是临时诊断，是常驻行为。
+        // 缓冲区用局部变量而不是 static：每次迭代都会重新填，用 static 只会
+        // 让「nm 指向一块会被下一次迭代覆写的内存」这个隐患留在代码里，
+        // 一旦以后有人把 nm 攒进数组再统一打印，全部条目会变成同一个串。
+        char nrbuf[24];
+        const char *nm = (nm0 && *nm0) ? nm0
+                                       : (snprintf(nrbuf, sizeof(nrbuf), "nr=%d",
+                                                   g_sc_seq[k].nr), nrbuf);
         const char *what = "";
         switch (g_sc_seq[k].nr) {
         case 222: what = "addr,len,prot"; break;
@@ -1755,11 +1808,26 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     case SYS_write:
     case SYS_writev: {
         int hfd = guest_fd_host((int)a0);
-        if (hfd < 0) return -L_EBADF;
+        // 2026-11-07 审计：这段 fd 表转储原本放在下面 EBADF 返回之后 12 行，
+        // 而它要抓的正是「write 到标准 fd 但表里是空的」——也就是 hfd<0 这一支，
+        // 所以它是一段永远执行不到的死代码，之前一次都没打过。
+        // ripgrep 的 write(1) 拿 EBADF（statx 不认 AT_EMPTY_PATH 导致 close(1)
+        // 再重开）就是这么漏掉的。挪到返回之前，它才可能在真出事时留痕。
+        if (hfd < 0) {
+            if ((int)a0 >= 0 && (int)a0 < 4)
+                fprintf(stderr, "[mlc][诊断] write 到标准 fd %d 但 fd 表里是空的："
+                                "fd0=%d fd1=%d fd2=%d fd3=%d\n",
+                        (int)a0, g_fd_map[0], g_fd_map[1], g_fd_map[2], g_fd_map[3]);
+            return -L_EBADF;
+        }
         if (nr == SYS_write) {
-            if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+            // 审计修正：原写法 a2 > GUEST_IO_MAX 时把 len 传 0，guest_ptr_ok 只
+            // 校验首字节，紧接着却 write 整个 a2 字节——超过 1GB 的写入等于
+            // 拿未校验的客户机指针直接读。超大请求一律按 EFAULT 拒掉。
+            if (a2 > GUEST_IO_MAX) return -L_EFAULT;
+            if (!guest_ptr_ok(a1, a2)) return -L_EFAULT;
             // K2 排查：客户机报 symbol lookup error 时抓调用链（见 mlc_dump_guest_backtrace）。
-            if (a2 > 32 && a2 <= GUEST_IO_MAX &&
+            if (a2 > 32 &&
                 memmem((const void *)(uintptr_t)a1, (size_t)a2, "symbol lookup error", 19))
                 mlc_dump_guest_backtrace(regs);
             mlc_dump_sc_args("此刻（write 报错点）");
@@ -1776,7 +1844,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
             for (uint64_t i = 0; i < cnt; i++) {
                 uint64_t base = *(uint64_t *)(a1 + i * 16);
                 uint64_t len  = *(uint64_t *)(a1 + i * 16 + 8);
-                if (!guest_ptr_ok(base, len > GUEST_IO_MAX ? 0 : len)) return -L_EFAULT;
+                if (!guest_io_ptr_ok(base, len)) return -L_EFAULT;
                 if (len > 32 && len <= GUEST_IO_MAX) {
                     const void *p = (const void *)(uintptr_t)base;
                     if (memmem(p, (size_t)len, "symbol lookup error", 19) ||
@@ -1796,18 +1864,18 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         // F65：设备 fd 必须先判，它们没有宿主 fd（表里是 -1 占位），
         // 走到下面 guest_fd_host 的 EBADF 分支就再也读不到了
         if ((int)a0 >= 0 && (int)a0 < GUEST_FD_MAX && g_dev_random[(int)a0]) {
-            if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+            if (!guest_io_ptr_ok(a1, a2)) return -L_EFAULT;
             mlc_rand_fill((void *)a1, (size_t)a2);
             return (int64_t)a2;
         }
         if ((int)a0 >= 0 && (int)a0 < GUEST_FD_MAX && g_dev_zero[(int)a0]) {
-            if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+            if (!guest_io_ptr_ok(a1, a2)) return -L_EFAULT;
             memset((void *)a1, 0, (size_t)a2);
             return (int64_t)a2;
         }
         int hfd = guest_fd_host((int)a0);
         if (hfd < 0) return -L_EBADF;
-        if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+        if (!guest_io_ptr_ok(a1, a2)) return -L_EFAULT;
         ssize_t r = read(hfd, (void *)a1, (size_t)a2);
         return r < 0 ? -errno : r;
     }
@@ -1820,7 +1888,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         for (uint64_t i = 0; i < cnt; i++) {
             uint64_t base = *(uint64_t *)(a1 + i * 16);
             uint64_t len  = *(uint64_t *)(a1 + i * 16 + 8);
-            if (!guest_ptr_ok(base, len > GUEST_IO_MAX ? 0 : len)) return -L_EFAULT;
+            if (!guest_io_ptr_ok(base, len)) return -L_EFAULT;
             ssize_t r = read(hfd, (void *)base, (size_t)len);
             if (r < 0) return total ? total : -errno;
             total += r;
@@ -1831,14 +1899,14 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     case SYS_pread64: {
         int hfd = guest_fd_host((int)a0);
         if (hfd < 0) return -L_EBADF;
-        if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+        if (!guest_io_ptr_ok(a1, a2)) return -L_EFAULT;
         ssize_t r = pread(hfd, (void *)a1, (size_t)a2, (off_t)a3);
         return r < 0 ? -errno : r;
     }
     case SYS_pwrite64: {
         int hfd = guest_fd_host((int)a0);
         if (hfd < 0) return -L_EBADF;
-        if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
+        if (!guest_io_ptr_ok(a1, a2)) return -L_EFAULT;
         ssize_t r = pwrite(hfd, (const void *)a1, (size_t)a2, (off_t)a3);
         return r < 0 ? -errno : r;
     }
@@ -1908,7 +1976,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         int r;
         // a3 是 flags：AT_SYMLINK_NOFOLLOW(0x100) 时用 lstat
         int nofollow = (a3 & 0x100) != 0;
-        if (a0 == (uint64_t)-100 /*AT_FDCWD*/)
+        if (A0_IS_AT_FDCWD(a0))
             r = nofollow ? lstat(hpath, &hs) : stat(hpath, &hs);
         else
             r = fstatat(guest_fd_host((int)a0), hpath, &hs, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
@@ -1924,9 +1992,24 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         if (guest_to_host_path((const char *)a1, hpath, sizeof(hpath)) < 0) return -L_ENAMETOOLONG_;
         struct stat hs;
         int nofollow = (a2 & 0x100) != 0;    // AT_SYMLINK_NOFOLLOW
-        int r = (a0 == -100) ? (nofollow ? lstat(hpath, &hs) : stat(hpath, &hs))
-                             : fstatat(guest_fd_host((int)a0), hpath, &hs,
-                                       nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+        // AT_EMPTY_PATH（Linux 0x1000）：path 为空串，按 dirfd 这个 fd 本身取状态。
+        // 2026-11-07 第七轮补，试用 ripgrep 15.2.0 时抓到：Rust 的 std 用
+        // statx(fd, "", AT_EMPTY_PATH) 探测 fd 类型（is_terminal 与 metadata 都走它），
+        // 而 macOS 的 fstatat 不认空路径，回 ENOTDIR。客户机据此判定 fd 有问题，
+        // 于是 close(1) 再重开，最终 write(1) 拿到 EBADF——ripgrep 明明搜到了内容，
+        // stdout 却一个字节都不出。实参形状：a0=1（fd）a1=空串 a2=0x1000。
+        int empty_path = (a2 & 0x1000) && *(const char *)a1 == '\0';
+        int r;
+        if (empty_path) {
+            int hfd = guest_fd_host((int)a0);
+            if (hfd < 0) return -L_EBADF;
+            r = fstat(hfd, &hs);
+        } else if (A0_IS_AT_FDCWD(a0)) {
+            r = nofollow ? lstat(hpath, &hs) : stat(hpath, &hs);
+        } else {
+            r = fstatat(guest_fd_host((int)a0), hpath, &hs,
+                        nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+        }
         if (r < 0) return -errno;
         uint8_t *b = (uint8_t *)a4;
         memset(b, 0, 256);
@@ -2093,6 +2176,101 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         if (g0 < 0 || g1 < 0) { close(fds[0]); close(fds[1]); return -L_EMFILE_; }
         ((int *)a0)[0] = g0; ((int *)a0)[1] = g1;
         return 0;
+    }
+    // 2026-11-07 第七轮补：试用 ripgrep 15.2.0（glibc 动态版）时它启动就发
+    // nr=73 ppoll(a0=fds a1=3 a2=timespec)，整条链断在这儿。
+    // Linux: poll(fds, nfds, timeout_ms)；ppoll(fds, nfds, tmo_p, sigmask)。
+    // struct pollfd 两侧布局一致 {int fd; short events; short revents;}，
+    // 但 fd 号必须客户机→宿主翻译，否则 poll 的是不存在的 fd。
+    case SYS_poll:
+    case SYS_ppoll: {
+        // 客户机 struct pollfd 与宿主逐字节同构：{int fd; short events; short revents;}，
+        // 跨距 8，revents 在偏移 6。2026-11-07 审计修正：第七轮这里按跨距 12、
+        // revents 偏移 8 解，两项都是错的——实测 sizeof(struct pollfd)==8、
+        // offsetof(revents)==6。后果有两个：nfds>1 时从第 2 项起读到的 fd/events
+        // 全是错位垃圾；revents 写在第 8 字节，正好落到下一个 pollfd 的 fd 字段上，
+        // 最后一项还会写出客户机数组末端两字节。用静态断言钉住，布局一变编译期就炸，
+        // 不会再静默写穿客户机内存。
+        enum { G_POLLFD_SIZE = 8, G_POLLFD_REVENTS = 6, G_POLLFD_MAX = 64 };
+        _Static_assert(sizeof(struct pollfd) == G_POLLFD_SIZE,
+                       "宿主 struct pollfd 跨距变了，客户机侧假设必须重新核对");
+        _Static_assert(offsetof(struct pollfd, revents) == G_POLLFD_REVENTS,
+                       "宿主 struct pollfd 的 revents 偏移变了，客户机侧假设必须重新核对");
+        _Static_assert(offsetof(struct pollfd, fd) == 0
+                       && offsetof(struct pollfd, events) == 4,
+                       "宿主 struct pollfd 的 fd/events 偏移变了，客户机侧假设必须重新核对");
+        uint64_t nfds = a1;
+        if (nfds > G_POLLFD_MAX) return -L_EINVAL;
+        if (nfds && !guest_ptr_ok(a0, nfds * G_POLLFD_SIZE)) return -L_EFAULT;
+        int timeout_ms = -1;
+        if (nr == SYS_poll) {
+            timeout_ms = (int)a2;                 // poll 第三参就是毫秒
+        } else if (a2) {
+            if (!guest_ptr_ok(a2, 16)) return -L_EFAULT;
+            struct timespec ts;
+            memcpy(&ts, (void *)a2, 16);
+            timeout_ms = (int)((int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+        }
+        // 无限超时同样会挂死（宿主 poll 是睡眠不是轮询），与 wait4 同一类问题。
+        // 设上限并留痕：宁可让客户机早点看到 0 个就绪 fd，也不能让进程消失。
+        // 审计补充分开两种情况的日志：无限期和「有限但超过上限」是两回事，
+        // 第七轮把两者混成一句「无限期 poll」，排查时会误导。
+        int cap_ms = 10000;
+        {
+            const char *e = getenv("MLC_POLL_MAX_MS");
+            if (e && *e) { int v = atoi(e); if (v > 0) cap_ms = v; }
+        }
+        if (timeout_ms < 0) {
+            fprintf(stderr, "[mlc][警告] 客户机请求无限期 poll，砍到 %d ms\n", cap_ms);
+            timeout_ms = cap_ms;
+        } else if (timeout_ms > cap_ms) {
+            fprintf(stderr, "[mlc][提示] 客户机 poll 超时 %d ms 超过上限，砍到 %d ms\n",
+                    timeout_ms, cap_ms);
+            timeout_ms = cap_ms;
+        }
+        struct pollfd hp[G_POLLFD_MAX];
+        int idx_of[G_POLLFD_MAX];     // 客户机下标 -> 宿主槽位，设备项记 -1
+        int nh = 0;
+        // 先决定每一项是不是虚拟设备：设备没有真宿主语义（后备 fd 是 /dev/null），
+        // 恒就绪，不放进宿主 poll，直接把 revents 按 events 填回去。
+        int8_t isdev[G_POLLFD_MAX];
+        for (uint64_t i = 0; i < nfds; i++) {
+            uint64_t p = a0 + i * G_POLLFD_SIZE;
+            int32_t gfd; int16_t ev;
+            memcpy(&gfd, (void *)p, 4);
+            memcpy(&ev, (void *)(p + 4), 2);
+            isdev[i] = (int8_t)guest_fd_is_dev(gfd);
+            if (isdev[i]) { idx_of[i] = -1; continue; }
+            hp[nh].fd = guest_fd_host(gfd);       // -1 也照传：宿主 poll 回 POLLNVAL
+            hp[nh].events = ev;
+            hp[nh].revents = 0;
+            idx_of[i] = nh;
+            nh++;
+        }
+        // 全是虚拟设备（或 nfds 为 0）时没有真 fd 要等：宿主 poll(hp,0,t) 会睡满
+        // 整个超时才返回 0，而设备其实是就绪的——客户机就此白等一轮。
+        // 审计修正：nh==0 时根本不调宿主 poll，直接按设备就绪收尾。
+        int r = 0;
+        if (nh > 0) {
+            r = poll(hp, (nfds_t)nh, timeout_ms);
+            if (r < 0) return -errno;
+        }
+        // 把 revents 写回客户机数组的原始下标。第七轮原实现按 fd 值回找下标，
+        // 客户机把同一个 fd 放两项时（合法）会 break 在第一个匹配上，
+        // 第二项的 revents 永远留着旧值。改成用 idx_of 直接定位，O(n) 且无歧义。
+        for (uint64_t j = 0; j < nfds; j++) {
+            uint64_t p = a0 + j * G_POLLFD_SIZE;
+            int16_t rv;
+            if (isdev[j]) {
+                int16_t ev; memcpy(&ev, (void *)(p + 4), 2);
+                rv = (int16_t)(ev & (POLLIN | POLLOUT | POLLERR | POLLHUP | POLLPRI));
+            } else {
+                rv = hp[idx_of[j]].revents;
+            }
+            memcpy((void *)(p + G_POLLFD_REVENTS), &rv, 2);
+            if (rv) r++;
+        }
+        return r;
     }
     case SYS_dup: {
         int hfd = guest_fd_host((int)a0);
@@ -2427,8 +2605,8 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         if (!guest_str_ok(a1, 4096)) return -L_EFAULT;
         char hpath[1024];
         if (guest_to_host_path((const char *)a1, hpath, sizeof(hpath)) < 0) return -L_ENAMETOOLONG_;
-        int r = (a0 == -100) ? access(hpath, (int)a2)
-                             : faccessat(guest_fd_host((int)a0), hpath, (int)a2, 0);
+        int r = A0_IS_AT_FDCWD(a0) ? access(hpath, (int)a2)
+                                   : faccessat(guest_fd_host((int)a0), hpath, (int)a2, 0);
         return r < 0 ? -errno : 0;
     }
     case SYS_readlinkat: {
@@ -2453,7 +2631,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         if (guest_to_host_path(lp, hpath, sizeof(hpath)) < 0) return -L_ENAMETOOLONG_;
         char *tmp = (char *)malloc(a3 ? (size_t)a3 : 1);
         if (!tmp) return -L_ENOMEM;
-        int hdir = (a0 == (uint64_t)-100) ? AT_FDCWD : guest_fd_host((int)a0);
+        int hdir = A0_IS_AT_FDCWD(a0) ? AT_FDCWD : guest_fd_host((int)a0);
         ssize_t r = readlinkat(hdir, hpath, tmp, (size_t)a3);
         if (r < 0) { int e = errno; free(tmp); return -e; }
         memcpy((void *)a2, tmp, (size_t)r);
@@ -2639,6 +2817,10 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         // 2026-11-06 审计 F46：原先返回 ENOSYS，实测有约 2% 的概率让 glibc 早期初始化
         // 把 TPIDR_EL0 写成 0x1006/0x1008 一类的野值，随后 errno 写入点崩在 NULL+0x9bf。
         // 崩溃点恒定在两次 sigaltstack 之后，补上本实现后复测三百次零复现。
+        // 2026-11-07 第七轮补充：F46 把这个分支挂在 43 号上，而 43 是 statfs64，
+        // 真正的 sigaltstack 是 132，所以 F46 之后客户机仍然每次拿 ENOSYS。
+        // 该分支已改挂 132；「TPIDR_EL0 野值崩溃」是否真的随之消失需要重测，
+        // 不能再拿一个没被触发过的分支当修复证据。
         g_stack_t ns, old;
         if (a1) {
             if (!guest_ptr_ok(a1, 24)) return -L_EFAULT;

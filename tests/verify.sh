@@ -2,9 +2,49 @@
 # MLC v1 验证脚本：构建测试载荷并逐项检查兼容层能力
 set -uo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$PROJECT_ROOT/src"
+REAL_SRC="$PROJECT_ROOT/src"
 TESTS="$PROJECT_ROOT/tests"
 PASS=0; FAIL=0
+
+# ---------- 看门狗包装器（2026-11-07 审计追加）----------
+# macOS 没有 timeout 命令，而 mlc-core 偶发无限空转（客户机 sh -c 执行外部命令
+# 那条路径）。2026-11-07 实测：一个 rootfs 冒烟循环因此跑了 6 小时，泄漏出 36 个
+# 各占约 30% CPU 的孤儿进程，load average 37.59，只能手工清理。
+# 套件里有 35 个调用点，逐个包看门狗改动太大且容易漏。这里在临时目录放两个
+# 同名包装器，把 SRC 指过去，所有调用点自动获得超时保护，无需逐处改写。
+# 超时按进程组整组强杀（子进程自己 setpgrp），绝不留孤儿。
+# 超时值可用 MLC_CALL_TIMEOUT 调，单位秒。
+WRAP="${TMPDIR:-/tmp}/mlc-verify-wrap"
+rm -rf "$WRAP"; mkdir -p "$WRAP"
+for t in mlc-core mlc; do
+    sed -e "s|@REAL@|$PROJECT_ROOT/src/$t|g" > "$WRAP/$t" <<'EOF'
+#!/bin/bash
+# 自动生成的看门狗包装器：给 @REAL@ 加超时保护，超时整组强杀。
+real="@REAL@"
+tmo="${MLC_CALL_TIMEOUT:-120}"
+perl -e '
+    my $tmo = shift @ARGV;
+    my $pid = fork;
+    if (!$pid) { setpgrp(0,0); exec @ARGV; exit 127; }
+    my $to = 0;
+    local $SIG{ALRM} = sub {
+        $to = 1;
+        kill "TERM", -$pid;
+        sleep 1;
+        kill "KILL", -$pid;
+    };
+    alarm $tmo;
+    waitpid($pid, 0);
+    my $rc = $?;
+    alarm 0;
+    if ($to) { print STDERR "[mlc][看门狗] 超过 ${tmo}s 未结束，已整组强杀\n"; exit 124; }
+    exit $rc >> 8;
+' "$tmo" "$real" "$@"
+EOF
+    chmod +x "$WRAP/$t"
+done
+SRC="$WRAP"
+trap 'rm -rf "$WRAP"' EXIT
 
 ok()   { echo "  [通过] $1"; PASS=$((PASS+1)); }
 bad()  { echo "  [失败] $1"; FAIL=$((FAIL+1)); }
@@ -12,14 +52,26 @@ bad()  { echo "  [失败] $1"; FAIL=$((FAIL+1)); }
 echo "=== MLC v1 验证 ==="
 
 # 0. 构建核心
+# REAL_SRC 是真实源码目录：$SRC 已被上面的看门狗包装器占用，构建必须落到真身上，
+# 否则 clang 会去包装器目录里找 mlc-core.c。
 echo "[0] 构建 mlc-core"
-if clang -O2 -Wall -o "$SRC/mlc-core" "$SRC/mlc-core.c" 2>/dev/null; then ok "编译"; else bad "编译"; exit 1; fi
+if clang -O2 -Wall -o "$REAL_SRC/mlc-core" "$REAL_SRC/mlc-core.c" 2>"$TESTS/.build.err"; then
+    ok "编译"
+else
+    bad "编译"
+    echo "  --- clang 输出 ---"
+    sed 's/^/  /' "$TESTS/.build.err"
+    rm -f "$TESTS/.build.err"
+    exit 1
+fi
+rm -f "$TESTS/.build.err"
 
 # 1. 构建测试载荷（位置无关 ET_DYN ELF）
 echo "[1] 构建测试载荷"
 python3 "$TESTS/mkelf.py" "$TESTS/test.s" "$TESTS/test.elf" >/dev/null 2>&1 && ok "mkelf 生成" || bad "mkelf 生成"
 python3 "$TESTS/mkelf.py" "$TESTS/regs.s" "$TESTS/regs.elf" >/dev/null 2>&1 && ok "regs 载荷生成" || bad "regs 载荷生成"
 python3 "$TESTS/mkelf.py" "$TESTS/tp.s" "$TESTS/tp.elf" >/dev/null 2>&1 && ok "tp 载荷生成" || bad "tp 载荷生成"
+python3 "$TESTS/mkelf.py" "$TESTS/poll.s" "$TESTS/poll.elf" >/dev/null 2>&1 && ok "poll 载荷生成" || bad "poll 载荷生成"
 # 目录列举与文件读入的目标用 rootfs 内的自建子目录：
 # 客户机看到的 / 就是 rootfs（v1.2 路径重写语义），不能写真实 /tmp
 GUEST_TMP="$PROJECT_ROOT/rootfs/sysroot/tmp/mlc-dent-test"
@@ -162,7 +214,9 @@ P_OUT=$("$SRC/mlc" sh -c 'ls /' 2>/dev/null | head -1); PRC=${PIPESTATUS[0]}
 echo "[9] mlc 拷到别处后仍能定位项目根"
 FAKE_BIN="$TESTS/.fakebin"
 rm -rf "$FAKE_BIN" && mkdir -p "$FAKE_BIN"
-cp "$SRC/mlc" "$FAKE_BIN/mlc"
+# 用 REAL_SRC：这里要拷的是 src/mlc 那个真脚本本身（拷过去还要 sed 改
+# INSTALL_HOME），$SRC 已经指向看门狗包装器，拷它没有任何意义。
+cp "$REAL_SRC/mlc" "$FAKE_BIN/mlc"
 chmod +x "$FAKE_BIN/mlc"
 # 复刻安装脚本的动作：把真实项目根写进 INSTALL_HOME
 sed -i '' "s|^INSTALL_HOME=\"\"|INSTALL_HOME=\"$PROJECT_ROOT\"|" "$FAKE_BIN/mlc"
@@ -225,7 +279,7 @@ for d in /etc / /usr/bin; do
     if [ $rc -eq 0 ] && [ "$nbad" -eq 0 ]; then
         ok "ls -l $d 退出码 0 且无 cannot read symbolic link"
     else
-        bad "ls -l $d 退出码 $rc，cannot read symbolic link $nbad 处"
+        bad "ls -l $d 退出码 ${rc}，cannot read symbolic link ${nbad} 处"
     fi
 done
 # 符号链接的目标名要真的解析出来（/etc 里 rmt 指向 /usr/sbin/rmt）
@@ -255,6 +309,91 @@ else
 fi
 
 echo
+echo "[12] poll / ppoll 的 pollfd 布局（2026-11-07 审计追加）"
+# 为什么值得单列一段：第七轮补 ppoll 时把客户机 struct pollfd 的跨距写成 12、
+# revents 偏移写成 8，而两侧真实布局都是跨距 8、revents 在偏移 6
+# （实测 sizeof(struct pollfd)==8、offsetof(revents)==6）。
+# 后果有两个，此前没有任何测试覆盖，所以套件一直绿着：
+#   1. nfds>1 时从第 2 项起读到的 fd/events 全是错位垃圾；
+#   2. revents 写在第 8 字节，正好落到下一个 pollfd 的 fd 字段上，
+#      最后一项还会写出数组末端两字节。
+# poll.elf 用 /dev/zero（引擎里的虚拟设备，恒就绪）做被 poll 的 fd，
+# revents 是确定值，不依赖 stdout 是管道还是终端。六项判据按位累加进退出码：
+#   bit0/bit1 就绪个数不是 2；bit2/bit3 revents 不是 POLLIN；
+#   bit4 pfds[1].fd 被踩坏；bit5 数组后的哨兵被改写。
+# 去牙实测：把源码里 G_POLLFD_SIZE 改回 12，退出码立刻变 60。
+POLL_OUT=$("$SRC/mlc-core" "$TESTS/poll.elf" 2>/dev/null); POLL_RC=$?
+case "$POLL_OUT" in
+    *"MLC: poll ok"*) [ $POLL_RC -eq 0 ] && ok "poll 与 ppoll 的 pollfd 布局正确（6 项判据全过）" \
+        || bad "poll 布局回归（退出码 ${POLL_RC}，按位：1=poll就绪数 2=ppoll就绪数 4=revents[0] 8=revents[1] 16=fd被踩 32=哨兵被写）" ;;
+    *) bad "poll 载荷没跑起来（退出码 ${POLL_RC}，输出 [$POLL_OUT]）" ;;
+esac
+
+echo
+echo "[13] ripgrep 冒烟（第七轮加，需 rootfs 里有 rg）"
+# 为什么值得单列一段：ripgrep 15.2.0 是第一个暴露出三处真实缺陷的客户机——
+#   ppoll（nr=73）整条没实现，启动即断；
+#   sigaltstack 挂错号（43 是 statfs64，132 才是），那个分支从来没被触发过；
+#   statx 不认 AT_EMPTY_PATH，Rust 的 std 拿 ENOTDIR 后 close(1) 再重开，
+#   最后 write(1) 拿到 EBADF，搜索成功而 stdout 一个字节都不出。
+# 这三个都不在原有 45 项的覆盖面里，所以留下这一组常驻判据。
+RG="$PROJECT_ROOT/rootfs/sysroot/usr/bin/rg"
+if [ ! -x "$RG" ]; then
+    echo "  [跳过] rootfs 里没有 rg（ripgrep）。装一个 aarch64 动态版到该路径即可启用本段："
+    echo "         https://github.com/BurntSushi/ripgrep/releases （aarch64-unknown-linux-gnu）"
+else
+    # 单文件搜索：退出码 0、输出里有行号、stdout 非空（第三条专盯 AT_EMPTY_PATH 那条）
+    RG_OUT=$("$SRC/mlc-core" "$RG" --threads 1 -n root /etc/passwd 2>/dev/null); RG_RC=$?
+    case "$RG_OUT" in
+        1:root:*) [ $RG_RC -eq 0 ] && ok "rg 单文件搜索（行号 + 内容）" || bad "rg 搜索成功但退出码 ${RG_RC}" ;;
+        "") bad "rg 有匹配却零输出——statx AT_EMPTY_PATH 很可能又坏了（客户机 close(1) 后 write 拿 EBADF）" ;;
+        *) bad "rg 输出形状不对：[$RG_OUT]" ;;
+    esac
+    # 递归 + 只列文件名：考验 getdents64 与目录遍历
+    RG_L=$("$SRC/mlc-core" "$RG" --threads 1 --no-ignore -l root /etc 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${RG_L:-0}" -gt 5 ]; then
+        ok "rg 递归搜 /etc 列出 ${RG_L} 个文件"
+    else
+        bad "rg 递归只列出 ${RG_L:-0} 个文件（预期 >5）"
+    fi
+    # 计数模式：-c 走的是同一条读路径，但输出形状不同（数字而非行）
+    RG_C=$("$SRC/mlc-core" "$RG" --threads 1 -c root /etc/passwd 2>/dev/null)
+    if [ "${RG_C:-0}" = "1" ]; then
+        ok "rg -c 计数为 1"
+    else
+        bad "rg -c 计数是 ${RG_C:-空}（预期 1）"
+    fi
+    # 多线程模式必然失败：M3（CLONE_THREAD）没实现。这一条记的是**已知边界**，
+    # 不是回归判据，所以只提示不算失败——ripgrep 默认按 CPU 核数开线程。
+    if "$SRC/mlc-core" "$RG" -n root /etc/passwd >/dev/null 2>&1; then
+        ok "rg 多线程模式也能跑（M3 已实现？把这条从提示改成判据）"
+    else
+        echo "  [提示] rg 多线程模式失败，符合预期：clone 的 CLONE_THREAD 归 M3，未实现。"
+    fi
+fi
+
+echo
+# 审计修正（2026-11-07）：原实现在重跑时直接 exec 覆盖整个进程，第一轮的
+# 失败项只留在日志中间，最终一行只印第二轮的 PASS/FAIL——看上去「失败 0 项」，
+# 而上一轮刚刚有 5 项真红。2026-11-07 实测正是如此：第一轮 5 项全红
+# （全是退出码 127），第二轮全绿，最终一行报「通过 49 项, 失败 0 项」。
+# 一个会把真实失败洗成绿色的门禁，比随机红的门禁更糟。
+# 现在第一轮的数字必须被带出来，最终一行同时显示两轮。
+# 退出码仍只看本轮：重跑的意义就是吸收 K2 的偶发，若改成看合计，
+# 每次 K2 抖动都会把门禁打红，重跑就白做了。洗白与打红之间取前者可查、
+# 后者可用——数字全部摆出来，人来判断那 5 项是不是真回归。
+if [ -n "${MLC_VERIFY_PREV:-}" ] && [ -f "${MLC_VERIFY_PREV}" ]; then
+    read -r PP PF < "${MLC_VERIFY_PREV}"
+    rm -f "${MLC_VERIFY_PREV}"
+    echo "=== 本轮: 通过 $PASS 项, 失败 $FAIL 项 ==="
+    echo "=== 两轮合计（自动重跑前第一轮 通过 $PP 项, 失败 $PF 项）: 通过 $((PASS+PP)) 项, 失败 $((FAIL+PF)) 项 ==="
+    if [ "$PF" -gt 0 ] && [ "$FAIL" -eq 0 ]; then
+        echo "[提示] 第一轮有 $PF 项失败，重跑后归零。失败项若全是退出码 127，那是已知"
+        echo "       缺陷 K2（docs/10）的偶发；否则就是被重跑吸收掉的真实回归，不要忽略。"
+    fi
+    [ "$FAIL" -eq 0 ]
+    exit $?
+fi
 echo "=== 结果: 通过 $PASS 项, 失败 $FAIL 项 ==="
 if [ $FAIL -ne 0 ]; then
     # 已知缺陷 K2（docs/10）会让个别客户机以约 0.5% 的概率失败：
@@ -263,9 +402,11 @@ if [ $FAIL -ne 0 ]; then
     # 因此这里自动重跑一次：确定性回归两次都会红，K2 的偶发第二次几乎必然绿。
     # 重跑次数可用 MLC_VERIFY_RETRY 调，设 0 关闭。
     if [ "${MLC_VERIFY_RETRY:-1}" -gt 0 ]; then
+        PREV_FILE="${TMPDIR:-/tmp}/mlc-verify-prev.$$"
+        echo "$PASS $FAIL" > "$PREV_FILE"
         echo "[提示] 有 $FAIL 项失败。已知缺陷 K2 会造成约 0.5% 的偶发失败，自动重跑一次。"
-        echo "[提示] 若第二次仍然红，就是真回归，不要忽略。"
-        MLC_VERIFY_RETRY=0 exec bash "$0" "$@"
+        echo "[提示] 重跑后会把第一轮的数字一并报出，不会洗白。"
+        MLC_VERIFY_RETRY=0 MLC_VERIFY_PREV="$PREV_FILE" exec bash "$0" "$@"
     fi
     exit 1
 fi
