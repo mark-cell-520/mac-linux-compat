@@ -441,8 +441,24 @@ static const uint32_t ML_STUB[] = {
 //
 // 约束：单线程模型下 TPIDR_EL0 必须恒等于 g_guest_tp_good（蹦桌进宿主调用前清零、
 // 出口还原，客户机代码不会在清零期间运行）。多线程（M3）落地后这条要重做。
+//
+// 2026-11-07 修正（缺陷 K2 的根因）：原存根把选中的值放在 x10 里，出口
+//     orr xN, xzr, x10
+// 只还原了 x0、x1、x9，**没有还原 x10**。而客户机的 mrs xN, TPIDR_EL0 只写 xN，
+// x10 在调用者手里可能是活的。实测全 rootfs 五个二进制里 mrs 共 2323 处，
+// 目标寄存器是 x10 的只有 4 处（libc 1530 处里 3 处、perl 524 处里 1 处，
+// libm 240 处里 0 处、ld.so 29 处里 0 处），也就是 2319 处都会把调用者手里的
+// x10 抹成 TCB 地址。TCB 是已映射的合法地址，抹了不会 SIGSEGV，只会让拿着
+// x10 当指针用的客户机代码读到 TCB 内容当符号表用——症状正是 K2：
+// 「symbol lookup error: undefined symbol: <任意符号>」，失败符号每轮都不一样，
+// 而内存镜像逐字节比对又查不出损坏（表确实是好的，坏的是指向表的那个寄存器）。
+// 现在改成用 x9 作载体，出口先还原 x10 再 orr，最后才还原 x9（目标寄存器恰为
+// x9 时那条 ldr 由补丁代码改成 nop，否则会把刚写进 x9 的结果又盖回去）。
+// 词数仍是 19，蹦桌槽大小不变。
+// 编码由 clang 汇编后逐条比对确认（0xd51bd040|N 是 msr 写、0xd53bd040|N 才是 mrs 读，
+// 这两者最早认错过，害了一圈弯路）。
 static const uint32_t ML_MRS_STUB[] = {
-    0xd10083ffu,       // 0  sub  sp, sp, #0x20
+    0xd100c3ffu,       // 0  sub  sp, sp, #0x30
     0xa90007e0u,       // 1  stp  x0, x1, [sp]
     0xa9012be9u,       // 2  stp  x9, x10, [sp, #0x10]
     0xd53bd049u,       // 3  mrs  x9, tpidr_el0        ← 现场值
@@ -451,22 +467,23 @@ static const uint32_t ML_MRS_STUB[] = {
     0xf2c0000au,       // 6  movk x10, #0, lsl #32     │
     0xf2e0000au,       // 7  movk x10, #0, lsl #48     ┘
     0xf940014au,       // 8  ldr  x10, [x10]           ← x10 = 有效 TCB（0 表示还没建立）
-    0xb400008au,       // 9  cbz  x10, notarmed        ← 未建立：跳到「取现场值」，不能抹掉它
+    0xb400008au,       // 9  cbz  x10, restore         ← 未建立：跳到「取现场值」，不能抹掉它
     0xeb0a013fu,       // 10 cmp  x9, x10
-    0x54000060u,       // 11 b.eq restore              ← 与有效 TCB 相同，直接用
-    0xaa0a03e9u,       // 12 mov  x9, x10              ← 野值顶替
-                        //    notarmed:（下标 13，由 cbz 落入）
-    0xaa0903eau,       // 13 mov  x10, x9              ← 选中的值搬进 x10（现场值或顶替值）
-                        //    restore:（下标 14，由 b.eq 落入）
-    0xa94007e0u,       // 14 ldp  x0, x1, [sp]         ← 先还原可能被覆盖的 x0/x1
-    0xf9400be9u,       // 15 ldr  x9, [sp, #0x10]      ← 还原原 x9（值已在 x10 里）
-    0xaa0a03e0u,       // 16 orr  xN, xzr, x10         ← 下标 16 运行时修补成目标寄存器
-    0x910083ffu,       // 17 add  sp, sp, #0x20
+    0x54000040u,       // 11 b.eq restore              ← 与有效 TCB 相同，直接用
+    0xaa0a03e9u,       // 12 mov  x9, x10              ← 野值顶替；三条路都在 x9 里留下选中值
+                        //    restore:（下标 13，由 cbz 与 b.eq 落入）
+    0xa94007e0u,       // 13 ldp  x0, x1, [sp]         ← 先还原可能被覆盖的 x0/x1
+    0xf9400feau,       // 14 ldr  x10, [sp, #0x18]     ← 还原客户机原 x10（K2 修正的关键）
+    0xaa0903e0u,       // 15 orr  xN, xzr, x9          ← 下标 15 运行时修补成目标寄存器
+    0xf9400be9u,       // 16 ldr  x9, [sp, #0x10]      ← 还原原 x9；目标寄存器是 x9 时改 nop
+    0x9100c3ffu,       // 17 add  sp, sp, #0x30
     0x14000000u,       // 18 b    返回客户机            ← 末条 B 立即数运行时修补
 };
 #define ML_MRS_STUB_WORDS (sizeof(ML_MRS_STUB) / sizeof(ML_MRS_STUB[0]))   // 19 词 = 76 字节
 #define ML_MRS_STUB_IDX_ADDR 4    // movz/movk 四条：g_guest_tp_good 的地址
-#define ML_MRS_STUB_IDX_DST  16   // orr xN, xzr, x10：N 由被拦指令给出
+#define ML_MRS_STUB_IDX_DST  15   // orr xN, xzr, x9：N 由被拦指令给出
+#define ML_MRS_STUB_IDX_X9REST 16 // ldr x9, [sp,#0x10]：目标寄存器是 x9 时须改成 nop
+#define AARCH64_NOP 0xd503201fu
 
 
 // 保存块布局（与 stub.s v5 对应）：下标 i 就是 x_i，即
@@ -1055,8 +1072,11 @@ static int patch_svc_in_range(uint8_t *content, size_t nbytes) {
             for (int h = 0; h < 4; h++)
                 t[ML_MRS_STUB_IDX_ADDR + h] =
                     (t[ML_MRS_STUB_IDX_ADDR + h] & ~(0xFFFFU << 5)) | ((tghalves[h] & 0xFFFF) << 5);
-            // 目标寄存器：orr xN, xzr, x10（N=0..30）
-            t[ML_MRS_STUB_IDX_DST] = 0xAA0A03E0u | (w[j] & 31u);
+            // 目标寄存器：orr xN, xzr, x9（N=0..30）
+            t[ML_MRS_STUB_IDX_DST] = 0xAA0903E0u | (w[j] & 31u);
+            // 目标寄存器恰为 x9 时，出口那条「还原原 x9」必须让位，否则刚写进 x9 的
+            // 选中值会被盖回客户机的旧 x9。改成 nop，其余寄存器不受影响。
+            if ((w[j] & 31u) == 9u) t[ML_MRS_STUB_IDX_X9REST] = AARCH64_NOP;
         }
         int64_t to_stub = (int64_t)stub - (int64_t)&w[j];
         int64_t to_ret  = (int64_t)(&w[j] + 1) - (int64_t)(stub + (nwords_stub - 1) * 4);
@@ -2248,7 +2268,8 @@ static image_t *load_image2(const char *path, int from_high) {
                     for (int h = 0; h < 4; h++)
                         t[ML_MRS_STUB_IDX_ADDR + h] =
                             (t[ML_MRS_STUB_IDX_ADDR + h] & ~(0xFFFFU << 5)) | ((tghalves[h] & 0xFFFF) << 5);
-                    t[ML_MRS_STUB_IDX_DST] = 0xAA0A03E0u | (v & 31u);
+                    t[ML_MRS_STUB_IDX_DST] = 0xAA0903E0u | (v & 31u);
+                    if ((v & 31u) == 9u) t[ML_MRS_STUB_IDX_X9REST] = AARCH64_NOP;
                 }
                 int64_t to_stub = (int64_t)stub - (int64_t)&svc[j];
                 int64_t to_ret  = (int64_t)(&svc[j] + 1) - (int64_t)(stub + (nwords_stub - 1) * 4);
@@ -2396,8 +2417,31 @@ static int64_t mlc_syscall_handler(uint64_t *regs) {
 // ---------- 主流程 ----------
 static uint8_t *g_load_base, *g_load_end;
 
+// 信号处理里读客户机内存必须自己兜住（2026-11-07，缺陷 K3）。
+// 原来 crash_handler 直接解引用 pc-8、pc-4、pc+4，而 glibc 的 _dl_map_segments
+// 会给段间对齐填充发 mprotect(PROT_NONE)，pc 恰好在段首时前两条就在那种页里。
+// 一读就二次故障，同一信号在处理器里反复重入，进程在 100% CPU 上原地打转，
+// 永远走不到末尾的 _exit(99)。实测抓到两个这样的进程，一个已经跑了 11.5 小时、
+// 烧掉 414 分钟 CPU；本机负载因此长期挂在 3.5 以上，同期所有失败率测量都被污染。
+// 现在按区域表先判可读性，不可读就返回一个不可能是指令的哨兵值，
+// 由调用方换成「不可读」字样。判据用区域表而不是 mprotect 试探：
+// 信号处理里不能再抛异常，试探本身就会二次故障。
+static uint32_t crash_rd32(uint64_t a) {
+    for (int i = 0; i < g_region_n; i++)
+        if (a >= g_region[i].start && a + 4 <= g_region[i].end)
+            return *(uint32_t *)(uintptr_t)a;
+    return 0xFFFFFFFFu;   // AArch64 未分配空间，任何真指令都不可能是它
+}
+#define CRASH_UNREADABLE 0xFFFFFFFFu
+
 static void crash_handler(int sig, siginfo_t *info, void *ctx) {
     ucontext_t *uc = (ucontext_t *)ctx;
+    // 兜底：第一件事就是把同一信号改回默认动作。crash_rd32 已经挡住了已知的
+    // 二次故障路径，但信号处理里读客户机内存这件事本身没有通用安全保证——
+    // 万一还有漏网的解引用，默认动作会让进程立刻终止，而不是让同一个信号在
+    // 处理器里反复重入、100% CPU 原地打转且永远到不了 _exit（缺陷 K3）。
+    // 代价是这种"处理器里的二次故障"拿不到完整诊断，但它本来也拿不到。
+    signal(sig, SIG_DFL);
     uint64_t pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
     uint64_t fa = (uint64_t)info->si_addr;
     // 客户机 TLS 指针：glibc 靠它找 TCB，值不对时 errno 写入点就是 NULL+小偏移。
@@ -2437,9 +2481,29 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
             (unsigned long long)(uintptr_t)g_win_base, (unsigned long long)(uintptr_t)g_win_end,
             (unsigned long long)(uintptr_t)g_win_low, (unsigned long long)(uintptr_t)g_win_high);
     // 故障指令与所在宿主页的真实权限：只有这两项能把"多卸了"与"被 PROT_NONE 了"
-    // 区分开，否则 B6 只能靠猜。
-    fprintf(stderr, "[mlc][崩溃] 故障指令 %08x，前两条 %08x %08x，后一条 %08x\n",
-            *(uint32_t *)pc, *(uint32_t *)(pc - 8), *(uint32_t *)(pc - 4), *(uint32_t *)(pc + 4));
+    // 区分开，否则 B6 只能靠猜。四处取值都经 crash_rd32 兜住——pc 落在段首时，
+    // 前两条在 glibc 发的 PROT_NONE 对齐填充页里，直接解引用会让处理器自己二次
+    // 故障并反复重入，进程 100% CPU 打转、永远到不了 _exit（缺陷 K3）。
+    {
+        char line[256];
+        int n = 0;
+        n += snprintf(line + n, sizeof(line) - n, "[mlc][崩溃] 故障指令");
+        uint32_t v[4]; uint64_t a[4];
+        v[0] = crash_rd32(pc);     a[0] = pc;
+        v[1] = crash_rd32(pc - 4); a[1] = pc - 4;
+        v[2] = crash_rd32(pc - 8); a[2] = pc - 8;
+        v[3] = crash_rd32(pc + 4); a[3] = pc + 4;
+        for (int k = 0; k < 4; k++) {
+            if (n >= (int)sizeof(line) - 32) break;
+            if (v[k] == CRASH_UNREADABLE)
+                n += snprintf(line + n, sizeof(line) - n, " 0x%llx=不可读", (unsigned long long)a[k]);
+            else
+                n += snprintf(line + n, sizeof(line) - n, " 0x%llx=%08x",
+                              (unsigned long long)a[k], v[k]);
+        }
+        snprintf(line + n, sizeof(line) - n, "\n");
+        fputs(line, stderr);
+    }
     // 全部通用寄存器：野指针是从哪个值算出来的，只有寄存器全表能回答
     {
         const uint64_t *g = (const uint64_t *)&uc->uc_mcontext->__ss.__x[0];
@@ -2484,8 +2548,14 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
                     (unsigned long long)(fa & ~0x3FFFULL));
     }
     if (sig == SIGSYS) {
-        fprintf(stderr, "[mlc][崩溃] SIGSYS：客户机执行了未拦截的 svc #0。故障指令=%08x 下一条=%08x\n",
-                *(uint32_t *)pc, *(uint32_t *)(pc + 4));
+        uint32_t c0 = crash_rd32(pc), cp1 = crash_rd32(pc + 4);
+        fprintf(stderr, "[mlc][崩溃] SIGSYS：客户机执行了未拦截的 svc #0。故障指令=%s 下一条=%s\n",
+                c0 == CRASH_UNREADABLE ? "不可读" : "见下一行",
+                cp1 == CRASH_UNREADABLE ? "不可读" : "见下一行");
+        if (c0 != CRASH_UNREADABLE)
+            fprintf(stderr, "[mlc][崩溃] 故障指令 %08x\n", c0);
+        if (cp1 != CRASH_UNREADABLE)
+            fprintf(stderr, "[mlc][崩溃] 下一条 %08x\n", cp1);
         for (int i = 0; i < g_nimg; i++) {
             uint64_t bs = (uint64_t)g_img[i].mem, be = bs + g_img[i].span;
             if (pc >= bs && pc < be)
