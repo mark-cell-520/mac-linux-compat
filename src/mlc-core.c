@@ -37,6 +37,8 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/mach_vm.h>
+#include <dlfcn.h>      // 看门狗用 dladdr 反查宿主 PC 归属哪个库
+#include <execinfo.h>   // 看门狗用 backtrace 打宿主侧调用链
 #include <signal.h>
 
 // ---------- Linux arm64 系统调用号（asm-generic/unistd.h） ----------
@@ -120,6 +122,28 @@
 #define SYS_rt_sigaction  134
 #define SYS_rt_sigprocmask 135
 #define SYS_getpgid       155
+// 158/199..212 是 glibc 实际会发的进程组与 socket 族调用。第六轮按 libc.so.6 的
+// 可执行段扫出来的站点补齐：158 getgroups、159 setgroups、156 getsid、157 setsid、
+// 198 socket、199 socketpair、200 bind、
+// 201 listen、202 accept、203 connect、206 sendto、207 recvfrom、208 setsockopt、
+// 209 getsockopt、210 shutdown、211 sendmsg、212 recvmsg。
+#define SYS_getsid        156
+#define SYS_setsid        157
+#define SYS_getgroups     158
+#define SYS_setgroups     159
+#define SYS_socket        198
+#define SYS_socketpair    199
+#define SYS_bind          200
+#define SYS_listen        201
+#define SYS_accept        202
+#define SYS_connect       203
+#define SYS_sendto        206
+#define SYS_recvfrom      207
+#define SYS_setsockopt    208
+#define SYS_getsockopt    209
+#define SYS_shutdown      210
+#define SYS_sendmsg       211
+#define SYS_recvmsg       212
 #define SYS_gettimeofday  169
 #define SYS_sigaltstack   43   // glibc 早期初始化会调它；曾返回 ENOSYS，见 F46
 
@@ -142,9 +166,11 @@
 #define L_ESPIPE 29
 #define L_ERANGE 34
 #define L_ENOSYS 38
+#define L_ECHILD 10
 #define L_ENOTSOCK 88
 #define L_EOPNOTSUPP 95
 #define L_ENOTSUP  95
+#define L_EAFNOSUPPORT 97
 #define L_EMFILE_  24
 #define L_ENOTDIR 20
 #define L_ENAMETOOLONG_ 36
@@ -1037,6 +1063,61 @@ static int g_exec_envc;
 // 因此 guest_state_reset 要一起清掉。
 static uint64_t g_exit_cleartid = 0;
 static int32_t  g_exit_cleartid_val = 0;
+
+// 本引擎 fork 出来的子进程登记表（2026-11-07 第六轮加）。
+// 为什么需要它：wait4 透传给宿主 waitpid 时，如果客户机给的 pid 不是我们的
+// 子进程，宿主 wait4 会**无限期睡眠**——它不是轮询，是等一个永不到来的 SIGCHLD。
+// 实测挂起现场：sh -c /usr/bin/id 偶发卡在 libsystem_kernel.dylib 的 __wait4
+// （dladdr 定位，PC=…+0x8204，LR=引擎的 mlc_syscall_handler_impl），PC 与全部
+// 寄存器在两轮挂起里逐字节相同，说明是一条固定路径而不是随机踩内存。
+// 先查登记表、查不到直接回 ECHILD，是唯一能让父进程脱身的办法。
+#define MAX_KIDS 64
+static pid_t g_kids[MAX_KIDS];
+static int   g_nkids = 0;
+
+// clone 的子进程分支要重新 arm 看门狗，而 watchdog_arm 定义在文件后部
+static void watchdog_arm(void);
+
+static void kid_register(pid_t p) {
+    if (p <= 0) return;
+    if (g_nkids < MAX_KIDS) { g_kids[g_nkids++] = p; return; }
+    // 满了就淘汰最旧的：客户机同时开 64 个子进程本就超出本层能力，
+    // 但「表满 → 新子进程查不到 → 它的 wait4 返回 ECHILD」比泄漏更糟。
+    fprintf(stderr, "[mlc][警告] 子进程登记表已满（%d），淘汰最旧的以接纳 pid=%d\n",
+            MAX_KIDS, (int)p);
+    for (int i = 1; i < MAX_KIDS; i++) g_kids[i - 1] = g_kids[i];
+    g_kids[MAX_KIDS - 1] = p;
+}
+static void kid_reap(pid_t p) {
+    for (int i = 0; i < g_nkids; i++) {
+        if (g_kids[i] == p) { g_kids[i] = g_kids[g_nkids - 1]; g_nkids--; return; }
+    }
+}
+static int kid_known(pid_t p) {
+    if (p <= 0) return 0;
+    for (int i = 0; i < g_nkids; i++) if (g_kids[i] == p) return 1;
+    return 0;
+}
+
+// 等一个已登记的子进程，带墙上时钟上限。返回 waitpid 的语义：
+// >0 收割到的 pid，0 表示超时仍未退出，<0 表示出错（errno 已设置）。
+// 为什么需要它：宿主 waitpid 对存活但没退出的子进程是无限期睡眠，客户机随之
+// 挂死。轮询必须按 CLOCK_MONOTONIC 实测——按名义睡眠量累加会在机器一忙时
+// 完全失真（实测 usleep(2000) 实际睡 10ms，记账 1178ms 时真实已过 5.7 秒）。
+static pid_t wait_kid(pid_t want, int *status, int opts, int budget_ms) {
+    struct timespec t0, now;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        pid_t r = waitpid(want, status, opts | WNOHANG);
+        if (r != 0) return r;                       // 收到状态或出错
+        if (want > 0 && kill(want, 0) < 0 && errno == ESRCH) { errno = ECHILD; return -1; }
+        usleep(500);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t el = (int64_t)(now.tv_sec - t0.tv_sec) * 1000
+                   + (now.tv_nsec - t0.tv_nsec) / 1000000;
+        if (el >= budget_ms) return 0;              // 超时
+    }
+}
 
 // execve 之前的旧镜像簿记清理。只清必须清的，其余留给新加载覆盖。
 static void guest_state_reset(void) {
@@ -2199,6 +2280,10 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
             // 子进程：诊断计数从零开始，蹦桌簿记按写时复制的现状继续用
             g_sc_total = 0;
             for (int i = 0; i < 512; i++) g_sc_by_nr[i] = 0;
+            // alarm() 不跨 fork：不重新 arm 的话子进程卡住时没有任何东西能把它
+            // 救出来，父进程只能在 wait4 里干等到看门狗超时。2026-11-07 实测
+            // sh -c /usr/bin/id 的挂起就是这么来的——子进程 execve 后不再前进。
+            watchdog_arm();
             if (do_child_settid) *(int32_t *)a3 = (int32_t)getpid();
             if (do_cleartid) {
                 g_exit_cleartid = (uint64_t)a3;
@@ -2209,6 +2294,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         // CLONE_CHILD_SETTID 要求父进程把子进程 TID 写进 parent_tidptr（a2）
         if ((flags & CLONE_CHILD_SETTID) && a2 && guest_ptr_ok(a2, 4))
             *(int32_t *)a2 = (int32_t)pid;
+        kid_register(pid);
         return (int64_t)pid;
     }
     case SYS_wait4: {
@@ -2222,8 +2308,49 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         if (a1) {
             if (!guest_ptr_ok(a1, 4)) return -L_EFAULT;
         }
-        pid_t r = waitpid((pid_t)a0, a1 ? &status : NULL, opts);
+        // 指定了具体 pid 却不在登记表里：绝不能放行给宿主。宿主 wait4 对陌生 pid
+        // 是无限期睡眠（没有 WNOHANG 时），客户机随即 100% CPU 空转或直接卡死，
+        // 看门狗 8 秒后才救得回来，而父进程拿不到任何线索。
+        // 直接回 ECHILD 是 Linux 的正确语义：那个 pid 确实不是你的子进程。
+        pid_t want = (pid_t)a0;
+        if (want > 0 && !kid_known(want)) {
+            fprintf(stderr, "[mlc][警告] wait4 等一个非本引擎 fork 的 pid=%d，返回 ECHILD（不放行宿主，否则无限阻塞）\n", (int)want);
+            return -L_ECHILD;
+        }
+        // 登记过的子进程也不直接放行。实测（2026-11-07 第六轮）：pid 确实是
+        // 本引擎 fork 出来的，宿主 wait4 却永久不返回——dladdr 把 PC 定在
+        // libsystem_kernel.dylib 的 __wait4，PC 与全部寄存器在多轮挂起里逐字节
+        // 相同。子进程自己不前进，而**子进程原先没有看门狗**（alarm 不跨 fork，
+        // 已在 clone 的子进程分支补 arm）。无限期等待对父进程就是挂起，
+        // 所以改成 WNOHANG 轮询加墙上时钟上限，超时强杀再收割。
+        pid_t r = -1;
+        int budget_ms = 2000;
+        {
+            const char *e = getenv("MLC_WAIT4_MS");
+            if (e && *e) { int v = atoi(e); if (v > 0) budget_ms = v; }
+        }
+        if (opts & WNOHANG) {
+            r = waitpid(want, a1 ? &status : NULL, opts);
+        } else {
+            r = wait_kid(want, a1 ? &status : NULL, opts, budget_ms);
+            if (r == 0) {
+                fprintf(stderr, "[mlc][警告] wait4 等 pid=%d 超过 %d ms 仍未退出，SIGKILL 后重新收割\n",
+                        (int)want, budget_ms);
+                if (want > 0) kill(want, SIGKILL);
+                // SIGKILL 之后仍可能收不回来：子进程卡在不可中断的内核等待时，
+                // 连 SIGKILL 都要等它回用户态才生效。收割同样要有上限，
+                // 否则父进程只是从一个无限阻塞换到另一个无限阻塞。
+                r = wait_kid(want, a1 ? &status : NULL, 0, budget_ms);
+                if (r == 0) {
+                    fprintf(stderr, "[mlc][致命] SIGKILL 后 %d ms 仍收不到 pid=%d 的退出状态，返回 ECHILD\n",
+                            budget_ms, (int)want);
+                    kid_reap(want);   // 簿记里去掉，免得后续 wait4 再撞同一堵墙
+                    return -L_ECHILD;
+                }
+            }
+        }
         if (r < 0) return -errno;
+        kid_reap(r);
         if (a1) {
             int ls = 0;
             if (WIFEXITED(status))       ls = (WEXITSTATUS(status) & 0xff) << 8;
@@ -2343,6 +2470,26 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         if (remp && !guest_ptr_ok(remp, 16)) return -L_EFAULT;
         struct timespec req, rem;
         memcpy(&req, (void *)reqp, 16);
+        // 2026-11-07 第六轮：原先这里把客户机的睡眠时长原样透传，没有上限。
+        // 实测挂起现场 PC 落在 libsystem_c 的 nanosleep、x0=0x3c（60 秒），
+        // 而看门狗 8 秒就报警——父进程看起来像死了，其实在睡。
+        // 先把长请求留痕（调用方是谁要靠它定位），再加可配上限。
+        int64_t want_ms = (int64_t)req.tv_sec * 1000 + (int64_t)(req.tv_nsec / 1000000);
+        int64_t cap_ms = 2000;
+        {
+            const char *e = getenv("MLC_SLEEP_MAX_MS");
+            if (e && *e) { long long v = atoll(e); if (v > 0) cap_ms = v; }
+        }
+        if (want_ms > 1000) {
+            fprintf(stderr, "[mlc][警告] 客户机请求睡眠 %lld ms（nr=%llu req=0x%llx rem=0x%llx，上限 %lld ms）\n",
+                    (long long)want_ms, (unsigned long long)nr,
+                    (unsigned long long)reqp, (unsigned long long)remp,
+                    (long long)cap_ms);
+        }
+        if (want_ms > cap_ms) {
+            req.tv_sec = cap_ms / 1000;
+            req.tv_nsec = (long)(cap_ms % 1000) * 1000000L;
+        }
         int r = nanosleep(&req, &rem);
         if (r < 0 && remp) memcpy((void *)remp, &rem, 16);
         return r < 0 ? -errno : 0;
@@ -2391,6 +2538,66 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     // 都拿到一个进程组号，属静默数据损坏，靠 trace 的实参形状才纠正过来（v1.2 F36）。
     case SYS_getpgid:
         return getpgid((pid_t)a0) < 0 ? -errno : getpgid((pid_t)a0);
+    // 158 是 getgroups，不是 getpgrp。第六轮一度按 getpgrp 实现（返回宿主进程组号），
+    // 立刻把 id 的 groups 输出打成一串垃圾组号：getgroups(0, NULL) 本该只回组数，
+    // 却拿到一个不小的进程组号，coreutils 按它去读栈上未初始化内存。
+    // 判据是实参形状——a0=0 a1=0 正是「先问有多少组」的调用法，而 getpgrp 无参。
+    // glibc 的 getpgrp 是 getpgid(0) 的内联，走 155，上面那个分支已经覆盖。
+    case SYS_getgroups: {
+        int n = (int)a0;
+        if (n == 0) return getgroups(0, NULL);
+        if (n < 0 || n > 256) return -L_EINVAL;
+        if (a1 && !guest_ptr_ok(a1, (uint64_t)n * 4)) return -L_EFAULT;
+        gid_t buf[256];
+        int r = getgroups(n, buf);
+        if (r < 0) return -errno;
+        // gid_t 两侧都是 4 字节，仍逐项 memcpy：客户机给的缓冲区可能未对齐
+        for (int i = 0; i < r; i++) {
+            uint32_t g = (uint32_t)buf[i];
+            memcpy((void *)(a1 + (uint64_t)i * 4), &g, 4);
+        }
+        return r;
+    }
+    case SYS_setgroups: {
+        int n = (int)a0;
+        if (n < 0 || n > 256) return -L_EINVAL;
+        if (a1 && !guest_ptr_ok(a1, (uint64_t)n * 4)) return -L_EFAULT;
+        gid_t buf[256];
+        for (int i = 0; i < n; i++) {
+            uint32_t g; memcpy(&g, (void *)(a1 + (uint64_t)i * 4), 4);
+            buf[i] = (gid_t)g;
+        }
+        return setgroups(n, buf) < 0 ? -errno : 0;
+    }
+    // socket 家族（asm-generic 198 起：198 socket、199 socketpair、200 bind、
+    // 201 listen、202 accept、203 connect、206 sendto、207 recvfrom、
+    // 208 setsockopt、209 getsockopt、210 shutdown、211 sendmsg、212 recvmsg）。
+    // 2026-11-07 第六轮补：glibc 的 NSS 会在每次取 passwd/group 之前先用
+    // socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK) 探 nscd，
+    // 原先落到 default 分支返回 ENOSYS，于是 id 每轮稳定打 4 条
+    // 「未实现的系统调用 nr=198 (a0=1 a1=80801 a2=0)」（a1=0x80801 =
+    // SOCK_CLOEXEC|SOCK_NONBLOCK|SOCK_STREAM，可据此确认身份）。
+    // 这里统一返回 EAFNOSUPPORT：语义诚实（本层确实没有 socket），且能让 glibc
+    // 立刻判定「nscd 不可用」转文件后端。**不能假成功**——假成功会让 glibc 去
+    // connect 一个不存在的 /var/run/nscd/socket，阻塞远比现在严重。
+    // 网络 syscall 整族未实现是已知缺口（整改清单 C 族），这里只堵住探测路径。
+    case SYS_socket:      return -L_EAFNOSUPPORT;
+    case SYS_socketpair:  return -L_EAFNOSUPPORT;
+    case SYS_bind:        return -L_ENOTSOCK;
+    case SYS_listen:      return -L_ENOTSOCK;
+    case SYS_accept:      return -L_ENOTSOCK;
+    case SYS_connect:     return -L_ENOTSOCK;
+    case SYS_sendto:      return -L_ENOTSOCK;
+    case SYS_recvfrom:    return -L_ENOTSOCK;
+    case SYS_setsockopt:  return -L_ENOTSOCK;
+    case SYS_getsockopt:  return -L_ENOTSOCK;
+    case SYS_shutdown:    return -L_ENOTSOCK;
+    case SYS_sendmsg:     return -L_ENOTSOCK;
+    case SYS_recvmsg:     return -L_ENOTSOCK;
+    case SYS_getsid:
+        return getsid(0) < 0 ? -errno : getsid(0);
+    case SYS_setsid:
+        return setsid() < 0 ? -errno : 0;
     case SYS_gettimeofday: {
         if (!a0) return 0;
         if (!guest_ptr_ok(a0, 16)) return -L_EFAULT;
@@ -3002,7 +3209,16 @@ static void crash_handler(int sig, siginfo_t *info, void *ctx) {
 
 // ---------- 看门狗诊断（MLC_WATCHDOG=秒数）----------
 // 死循环时 CPU 100% 且不再有系统调用，trace 完全看不到卡点。
-// 看门狗在超时时直接读故障线程的 PC，并报告它落在哪个镜像或蹦床里。
+// 看门狗在超时时直接读故障线程的 PC，并报告它落在哪个镜像或蹦桌里。
+//
+// 2026-11-07 第六轮：alarm() 的定时器**不跨 fork**（POSIX 明确规定）。所以
+// fork 出来的子进程天生没有看门狗，而它恰恰是最容易卡住的那个（execve 之后
+// longjmp 回 main 重载镜像，卡在那里父进程只能干等 wait4）。main 与 clone 的
+// 子进程分支必须各自 arm 一次。
+static int g_watchdog_secs = 0;
+static void watchdog_arm(void) {
+    if (g_watchdog_secs > 0) alarm((unsigned)g_watchdog_secs);
+}
 static void watchdog_handler(int sig, siginfo_t *info, void *ctx) {
     (void)sig; (void)info;
     ucontext_t *uc = (ucontext_t *)ctx;
@@ -3020,6 +3236,38 @@ static void watchdog_handler(int sig, siginfo_t *info, void *ctx) {
     }
     fprintf(stderr, "[mlc][看门狗] 超时未退出。PC=0x%llx（%s）LR=0x%llx\n",
             (unsigned long long)pc, where, (unsigned long long)lr);
+    // 分清是主进程还是 fork 出来的子进程在卡：子进程同样继承了 setitimer 看门狗，
+    // 而它的主循环已经不在 main 里， stall 的表现和父进程一模一样。
+    fprintf(stderr, "[mlc][看门狗] 本进程 pid=%d（登记的子进程 %d 个）\n",
+            (int)getpid(), g_nkids);
+    // 宿主侧调用链：PC 只知道卡在哪个库，不知道是谁一路调到这里的。
+    // backtrace() 只读内存，但信号处理器里仍可能二次故障，所以先恢复默认处置，
+    // 并且把输出直接写 fd 2（不用 stdio，处理器里缓冲区可能是半锁状态）。
+    {
+        signal(sig, SIG_DFL);
+        void *bt[24];
+        int n = backtrace(bt, 24);
+        fprintf(stderr, "[mlc][看门狗] 宿主调用链（%d 帧，PC 那帧在最前）：\n", n);
+        backtrace_symbols_fd(bt, n, 2);
+    }
+    // PC 落在宿主自己的库里时，光有地址看不出是哪个库。dladdr 对 dyld 共享缓存
+    // 里的地址也能给出路径与段基址，比「未知区域」四个字有用得多。
+    {
+        Dl_info di;
+        memset(&di, 0, sizeof(di));
+        if (dladdr((void *)(uintptr_t)pc, &di) && di.dli_fname) {
+            uint64_t off = di.dli_fbase ? pc - (uint64_t)(uintptr_t)di.dli_fbase : 0;
+            fprintf(stderr, "[mlc][看门狗] PC 宿主归属：%s + 0x%llx（符号 %s）\n",
+                    di.dli_fname, (unsigned long long)off,
+                    di.dli_sname ? di.dli_sname : "（无符号）");
+        }
+        if (dladdr((void *)(uintptr_t)lr, &di) && di.dli_fname && di.dli_fbase != (void *)(uintptr_t)pc) {
+            uint64_t off = (uint64_t)(uintptr_t)lr - (uint64_t)(uintptr_t)di.dli_fbase;
+            fprintf(stderr, "[mlc][看门狗] LR 宿主归属：%s + 0x%llx（符号 %s）\n",
+                    di.dli_fname, (unsigned long long)off,
+                    di.dli_sname ? di.dli_sname : "（无符号）");
+        }
+    }
     // 打印通用寄存器：死循环无系统调用，只能靠寄存器推断循环变量
     fprintf(stderr, "[mlc][看门狗] x0=%llx x1=%llx x2=%llx x3=%llx x4=%llx\n",
             (unsigned long long)uc->uc_mcontext->__ss.__x[0],
@@ -3079,11 +3327,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[mlc] 信号监听已启用\n");
     }
     if (getenv("MLC_WATCHDOG")) {
+        int secs = atoi(getenv("MLC_WATCHDOG"));
+        if (secs > 0) g_watchdog_secs = secs;
         struct sigaction wa = {0};
         wa.sa_sigaction = watchdog_handler; wa.sa_flags = SA_SIGINFO;
         sigaction(SIGALRM, &wa, NULL);
-        alarm((unsigned)atoi(getenv("MLC_WATCHDOG")));
-        fprintf(stderr, "[mlc] 看门狗已启用：%s 秒\n", getenv("MLC_WATCHDOG"));
+        watchdog_arm();
+        fprintf(stderr, "[mlc] 看门狗已启用：%d 秒（fork 出的子进程会各自重新 arm）\n", secs);
     }
     if (argc < 2) {
         fprintf(stderr, "用法: %s <linux-arm64-ELF（静态或动态）> [参数...]\n", argv[0]);
