@@ -797,10 +797,50 @@ static int engine_region_hit(uint64_t s, uint64_t e) {
 static uint8_t *g_win_base, *g_win_low, *g_win_high, *g_win_end;   // 客户机 body 窗口
 static uint8_t *g_tp_base, *g_tp_next, *g_tp_end;      // 蹦桌池
 
+// 客户机可见的随机源。默认走宿主 arc4random（真随机，每轮都不同）。
+// MLC_FIXED_RAND=1 时改成固定种子的 xorshift：每轮字节序列完全相同。
+// K2 排查用——客户机能拿到的随机值有三处（AT_RANDOM 的 16 字节、/dev/urandom、
+// getrandom），而 AT_RANDOM 正是 glibc 的 _dl_random，栈哨兵与指针哨兵都由它喂。
+// 若钉死之后失败从"每轮随机"变成"要么全败要么全成"，说明根因在随机值上，
+// 而不是在地址布局上（窗口基址钉死已经证明与布局无关，见 compat_window_init）。
+static uint64_t g_rand_state = 0x123456789ABCDEFULL;
+static int g_rand_fixed = -1;
+static void mlc_rand_fill(void *buf, size_t n) {
+    if (g_rand_fixed < 0) {
+        const char *e = getenv("MLC_FIXED_RAND");
+        g_rand_fixed = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (!g_rand_fixed) { arc4random_buf(buf, n); return; }
+    uint8_t *b = (uint8_t *)buf;
+    for (size_t i = 0; i < n; i++) {
+        g_rand_state ^= g_rand_state << 13;
+        g_rand_state ^= g_rand_state >> 7;
+        g_rand_state ^= g_rand_state << 17;
+        b[i] = (uint8_t)(g_rand_state >> 24);
+    }
+}
+
 static void compat_window_init(void) {
-    uint8_t *p = mmap(NULL, COMPAT_TP_SIZE + COMPAT_WIN_SIZE, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (p == MAP_FAILED) die("无法分配客户机地址窗口");
+    // K2 排查用：MLC_WIN_ADDR 把窗口基址钉死。窗口基址原本由 mmap(NULL) 自选，
+    // 每轮都不同，而引擎侧一切（蹦桌槽地址、B 跳转偏移、库的 hint 满足情况）
+    // 都是基址的确定性函数——也就是说失败本应是基址的函数，只是被随机性盖住了。
+    // 钉住之后同一个基址每次跑出来的布局逐字节相同，失败要么 0% 要么 100%，
+    // 于是可以拿"必败基址"与"必胜基址"两轮的完整转储做差分。
+    // 只接受 4GB 以上的 16MB 对齐地址：macOS ARM64 在 0x200000 到 4GB 之间
+    // 一律不能 MAP_FIXED（实测全部 ENOMEM）。
+    void *hint = NULL;
+    {
+        const char *e = getenv("MLC_WIN_ADDR");
+        if (e && *e) {
+            unsigned long long v = strtoull(e, NULL, 0);
+            if (v >= 0x100000000ULL && (v & 0xFFFFFFULL) == 0) hint = (void *)(uintptr_t)v;
+            else fprintf(stderr, "[mlc][警告] MLC_WIN_ADDR=0x%llx 不合要求（需 >=4GB 且 16MB 对齐），忽略\n", v);
+        }
+    }
+    uint8_t *p = mmap(hint, COMPAT_TP_SIZE + COMPAT_WIN_SIZE, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON | (hint ? MAP_FIXED : 0), -1, 0);
+    if (p == MAP_FAILED) die(hint ? "无法按 MLC_WIN_ADDR 分配客户机地址窗口（该地址可能已被占用）"
+                                  : "无法分配客户机地址窗口");
     g_tp_base = p; g_tp_next = p; g_tp_end = p + COMPAT_TP_SIZE;
     g_win_base = p + COMPAT_TP_SIZE;
     g_win_end = p + COMPAT_TP_SIZE + COMPAT_WIN_SIZE;
@@ -1316,7 +1356,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
         // 走到下面 guest_fd_host 的 EBADF 分支就再也读不到了
         if ((int)a0 >= 0 && (int)a0 < GUEST_FD_MAX && g_dev_random[(int)a0]) {
             if (!guest_ptr_ok(a1, a2 > GUEST_IO_MAX ? 0 : a2)) return -L_EFAULT;
-            arc4random_buf((void *)a1, (size_t)a2);
+            mlc_rand_fill((void *)a1, (size_t)a2);
             return (int64_t)a2;
         }
         if ((int)a0 >= 0 && (int)a0 < GUEST_FD_MAX && g_dev_zero[(int)a0]) {
@@ -1905,7 +1945,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     }
     case SYS_getrandom: {
         if (!guest_ptr_ok(a0, a1)) return -L_EFAULT;
-        arc4random_buf((void *)a0, (size_t)a1);
+        mlc_rand_fill((void *)a0, (size_t)a1);
         return (int64_t)a1;
     }
     case SYS_uname:
@@ -2852,7 +2892,7 @@ int main(int argc, char **argv) {
     }
     uint64_t platform = 0;
     { const char *plat = "aarch64"; size_t l = strlen(plat) + 1; p -= l; memcpy(p, plat, l); platform = (uint64_t)p; }
-    uint8_t randbytes[16]; arc4random_buf(randbytes, sizeof(randbytes));
+    uint8_t randbytes[16]; mlc_rand_fill(randbytes, sizeof(randbytes));
     uint64_t randptr = 0;
     { p -= 16; memcpy(p, randbytes, 16); randptr = (uint64_t)p; }
 
