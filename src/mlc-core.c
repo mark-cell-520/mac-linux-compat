@@ -791,6 +791,9 @@ static int engine_region_hit(uint64_t s, uint64_t e) {
 // 既保证 B 跳转可及，又让客户机根本碰不到蹦桌。
 #define COMPAT_WIN_SIZE (96ULL << 20)
 #define COMPAT_TP_SIZE  (16ULL << 20)
+// 客户机窗口的默认基址：1TB，16MB 对齐，远在宿主 malloc 堆（约 4.3GB）之上。
+// 选它的依据见 compat_window_init 里的 300 轮交替 A/B。
+#define MLC_WIN_DEFAULT_ADDR (0x10000000000ULL)
 // 主程序之后留给 ld.so 向下分配的间隙。ld.so 从自己的映射末端往下给新库找地址，
 // 间隔不够就会穿过主程序映射（v1.2 修）。按 Ubuntu base 的库总量取 48MB。
 #define COMPAT_LD_GAP   (48ULL << 20)
@@ -820,13 +823,55 @@ static void mlc_rand_fill(void *buf, size_t n) {
     }
 }
 
+// K2 排查三轮：把引擎侧独立 mmap(NULL) 出来的预留区钉到固定地址。
+// MLC_WIN_ADDR 只钉窗口，而 brk 预留区（32MB）与客户机栈（8MB）是另外两次
+// 独立 mmap(NULL)，不受它约束。实测钉窗口之后这两块仍在变，且两者偏移恒定
+// （60 轮全部是栈等于 brk 加 0x27ef490），也就是说它们是同一个自由度。
+// 上一轮据 MLC_WIN_ADDR 得出的「布局无关」因此作废：窗口钉死了，
+// 客户机堆与栈的位置还没钉死。要真正把客户机布局钉成单一取值，
+// 必须把这两块也钉上，再看失败是变成 0% 还是 100%。
+// 只接受 4GB 以上、宿主页对齐的地址（macOS ARM64 在 0x200000 到 4GB 之间
+// 一律不能 MAP_FIXED）。指定的地址被占用时回退自选并明确告知，
+// 不静默改变布局。
+static void *mlc_map_at(void *hint, size_t len, const char *what, int *pinned) {
+    void *r = mmap(hint, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON | (hint ? MAP_FIXED : 0), -1, 0);
+    if (r == MAP_FAILED && hint) {
+        fprintf(stderr, "[mlc][警告] 无法按 0x%llx 分配%s（地址可能被占用），回退自选\n",
+                (unsigned long long)(uintptr_t)hint, what);
+        r = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    }
+    if (r == MAP_FAILED) {
+        fprintf(stderr, "[mlc][致命] 无法分配%s\n", what);
+        exit(1);
+    }
+    if (pinned) *pinned = (hint && r == hint) ? 1 : 0;
+    return r;
+}
+
 static void compat_window_init(void) {
-    // K2 排查用：MLC_WIN_ADDR 把窗口基址钉死。窗口基址原本由 mmap(NULL) 自选，
-    // 每轮都不同，而引擎侧一切（蹦桌槽地址、B 跳转偏移、库的 hint 满足情况）
-    // 都是基址的确定性函数——也就是说失败本应是基址的函数，只是被随机性盖住了。
-    // 钉住之后同一个基址每次跑出来的布局逐字节相同，失败要么 0% 要么 100%，
-    // 于是可以拿"必败基址"与"必胜基址"两轮的完整转储做差分。
-    // 只接受 4GB 以上的 16MB 对齐地址：macOS ARM64 在 0x200000 到 4GB 之间
+    // 窗口基址。原本由 mmap(NULL) 自选，每轮一个取值；MLC_WIN_ADDR 可以覆盖。
+    //
+    // 2026-11-07 第五轮：自选基址是 K2（动态链接偶发符号查找失败）的主要来源，
+    // 已用 300 轮交替 A/B 定量——同一时刻、同一台机器、同一条命令：
+    //    窗口钉死在 0x10000000000 → 符号失败 30/300 = 10.0%
+    //    窗口自选                 → 符号失败 171/300 = 57.0%
+    // 六个 50 轮分段里钉死臂全部占优（1:26、9:27、8:25、4:31、6:32、2:30），
+    // 不是时段漂移造成的假象。轮询测 1TB/2TB/4TB/6TB 四个基址，失败率 1.7% 到
+    // 5.8%，说明起作用的不是某一个魔法地址，而是「离宿主自己的映射足够远」。
+    //
+    // 机理：自选时窗口落在约 4.3GB，正是宿主 malloc 堆与 mmap 区的所在。
+    // 而引擎的 C 系统调用处理器是跑在客户机栈上的（svc 蹦桌 sub sp 之后 blr
+    // 进来），它的栈帧里全是宿主指针——格式串、getenv 结果、malloc 区。
+    // 这些宿主指针落在客户机栈的「死区」，而客户机栈是登记过的客户机区域，
+    // 于是 guest_ptr_ok 对它们一律放行：宿主指针一旦落进某个客户机区域的
+    // 地址范围，引擎就会把宿主内存当客户机内存读写。窗口远在 1TB 以上时
+    // 宿主指针（4GB 一带）不可能落进任何客户机区域，这条路径自然断了。
+    //
+    // 所以这里把默认值从「自选」改成「按固定高位地址落位」：这不是给排查用的
+    // 探针，是产品默认行为。落位失败（地址被占用）才回退自选，并且必须留痕——
+    // 静默回退会把「已收敛」重新变成假象。
+    // 只接受 4GB 以上、16MB 对齐的地址：macOS ARM64 在 0x200000 到 4GB 之间
     // 一律不能 MAP_FIXED（实测全部 ENOMEM）。
     void *hint = NULL;
     {
@@ -837,10 +882,17 @@ static void compat_window_init(void) {
             else fprintf(stderr, "[mlc][警告] MLC_WIN_ADDR=0x%llx 不合要求（需 >=4GB 且 16MB 对齐），忽略\n", v);
         }
     }
+    if (!hint) hint = (void *)(uintptr_t)MLC_WIN_DEFAULT_ADDR;
     uint8_t *p = mmap(hint, COMPAT_TP_SIZE + COMPAT_WIN_SIZE, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANON | (hint ? MAP_FIXED : 0), -1, 0);
-    if (p == MAP_FAILED) die(hint ? "无法按 MLC_WIN_ADDR 分配客户机地址窗口（该地址可能已被占用）"
-                                  : "无法分配客户机地址窗口");
+    if (p == MAP_FAILED) {
+        int e = errno;
+        fprintf(stderr, "[mlc][警告] 无法按 0x%llx 落位客户机窗口（errno=%d），回退自选\n",
+                (unsigned long long)(uintptr_t)hint, e);
+        p = mmap(NULL, COMPAT_TP_SIZE + COMPAT_WIN_SIZE, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANON, -1, 0);
+    }
+    if (p == MAP_FAILED) die("无法分配客户机地址窗口");
     g_tp_base = p; g_tp_next = p; g_tp_end = p + COMPAT_TP_SIZE;
     g_win_base = p + COMPAT_TP_SIZE;
     g_win_end = p + COMPAT_TP_SIZE + COMPAT_WIN_SIZE;
@@ -1327,9 +1379,16 @@ static void fill_utsname(l_utsname_t *u) {
 // 完全相同，说明差异不在最终状态而在过程里。系统调用序列是过程的可观测投影，
 // 两轮序列第一次分叉的地方，就是根因所在。
 #define SC_SEQ_MAX 600
-static int g_sc_seq[SC_SEQ_MAX];
+// K2 排查二轮：连参数一起记。只记调用号看不出那 4 个 mprotect 到底在改哪块
+// 内存，也就分不清它是 ld.so 的 RELRO 保护还是把 malloc 出来的 l_scope /
+// l_versions 所在页打成了只读。参数是回答这个问题的唯一依据。
+typedef struct { int nr; int64_t ret; uint64_t a0, a1, a2; } sc_ent_t;
+static sc_ent_t g_sc_seq[SC_SEQ_MAX];
 static int g_sc_seq_n = 0;
 static int g_sc_trace = -1;
+static int g_sc_args = -1;
+static int g_dump_at_sc = -1;   // MLC_DUMP_AT_SC：在第 N 个系统调用处转储，0 为不启用
+#define MLSC_RET_PENDING INT64_MIN
 
 // K2 排查：把一个客户机地址归到引擎登记过的镜像上（主程序与 ld.so）。
 // 库是 ld.so 自己 mmap 进来的，引擎只把它们记在区域表里，不在 g_img 里，
@@ -1378,6 +1437,235 @@ static void mlc_dump_guest_backtrace(uint64_t *regs) {
     fflush(NULL);
 }
 
+// K2 排查二轮：把系统调用序列连同 mmap/munmap/mprotect/brk 的参数一起打出来。
+// 之所以要参数：只记调用号时，失败轮与成功轮在第 44 项之前逐项完全相同，
+// 而那 4 个连续的 mprotect 正是失败前最后一批动作——不改哪块内存、改成什么权限，
+// 全靠参数才能判断。它若是把 malloc 出来的 l_scope / l_versions 所在页打成
+// 只读或 PROT_NONE，_dl_lookup_symbol_x 的第一步就会落空，报的正是
+// undefined symbol。这不属于任何库的 PT_LOAD，此前按 PT_LOAD 全量比对时
+// 根本没覆盖到它。
+static const char *mlc_sc_name(uint64_t nr) {
+    switch (nr) {
+    case 56: return "openat";   case 57: return "close";    case 63: return "read";
+    case 64: return "write";    case 66: return "writev";   case 78: return "readlinkat";
+    case 80: return "fstat";    case 93: return "exit";     case 94: return "exit_group";
+    case 96: return "set_tid_address"; case 99: return "set_robust_list";
+    case 134: return "rt_sigaction";   case 174: return "getuid";
+    case 175: return "geteuid";        case 176: return "getgid";
+    case 177: return "getegid";        case 214: return "brk";
+    case 215: return "munmap";         case 222: return "mmap";
+    case 226: return "mprotect";       case 261: return "prlimit64";
+    case 293: return "rseq";           default: return "";
+    }
+}
+static void mlc_dump_sc_args(const char *tag) {
+    if (!g_sc_args) return;
+    fprintf(stderr, "[mlc][诊断] %s：带参数的系统调用（%d 个）\n", tag, g_sc_seq_n);
+    for (int k = 0; k < g_sc_seq_n; k++) {
+        const char *nm = mlc_sc_name((uint64_t)g_sc_seq[k].nr);
+        if (!nm) continue;
+        const char *what = "";
+        switch (g_sc_seq[k].nr) {
+        case 222: what = "addr,len,prot"; break;
+        case 226: what = "addr,len,prot"; break;
+        case 215: what = "addr,len";      break;
+        case 214: what = "newbrk";        break;
+        case 56:  what = "dirfd,path,flags"; break;
+        case 64:  what = "fd,buf,len";    break;
+        default:  break;
+        }
+        fprintf(stderr, "  [%3d] %-16s %-20s 0x%llx 0x%llx 0x%llx   ret=%lld\n",
+                k, nm, what,
+                (unsigned long long)g_sc_seq[k].a0,
+                (unsigned long long)g_sc_seq[k].a1,
+                (unsigned long long)g_sc_seq[k].a2,
+                (long long)g_sc_seq[k].ret);
+    }
+    fflush(NULL);
+}
+
+// K2 排查四轮：把「按区域表全量转储客户机内存」抽成函数，好让它在两个
+// 时机都能跑：退出时（原有），以及第 N 个系统调用处（新增 MLC_DUMP_AT_SC）。
+// 之所以需要第二个时机：失败轮与成功轮的系统调用序列在前 46 项逐项相同，
+// 而退出时的转储对成功轮来说已经跑完 perl，与失败轮根本不是同一个程序点，
+// 拿两份转储做差分等于拿两个时刻比。钉在第 N 个系统调用处，两侧才是同一点。
+// K2 排查五轮：在客户机内存里找「指向未登记区域」的 8 字节值。
+// 动机：同程序点（同一系统调用序号）比对失败轮与成功轮的完整转储，客户机内存
+// 几乎逐字节相同，唯一的例外是若干指向 0x102xxxxxx（约 4.3GB）的指针——
+// 那一带是宿主 malloc 堆，不在引擎登记的任何客户机区域里。客户机手里握着
+// 未登记指针意味着两件事之一：宿主地址漏进了客户机内存，或者某次映射漏登记。
+// 前者会让客户机直接读写引擎自己的堆，破坏程度逐轮不同——这与 K2「失败率
+// 随布局漂移」完全吻合。这个函数把漏网的指针连引用位置一起打出来。
+static void mlc_probe_unreg_ptrs(const char *tag) {
+    // 只在 MLC_PROBE_UNREG 打开时跑：逐 8 字节扫区域表，成本不低。
+    // 取值可以是 1（扫全表），也可以是 lo:hi（只扫客户机栈这类关心的一段）——
+    // 实测扫全表时前 64 个名额全被 perl 的 ELF 重定位条目占满（0x400000004
+    // 一类），真正想看的栈上指针一个都排不进来。
+    const char *e = getenv("MLC_PROBE_UNREG");
+    if (!e || !*e || strcmp(e, "0") == 0) return;
+    uint64_t only_lo = 0, only_hi = 0;
+    if (strchr(e, ':')) sscanf(e, "%llx:%llx",
+                               (unsigned long long *)&only_lo,
+                               (unsigned long long *)&only_hi);
+    // 汇总：值 -> 引用次数 + 首个引用地址（同一个值可能被引用几十次）
+    struct { uint64_t v; int cnt; uint64_t at; } top[64];
+    int ntop = 0;
+    long scanned = 0, hits = 0;
+    // 逐宿主页问可读性：客户机区域里合法存在 PROT_NONE 子页（glibc 的
+    // _dl_map_segments 会给段间间隙发 PROT_NONE），直接 memcpy 会 SIGSEGV。
+    // 这个坑是本函数第一版实测踩到的：探针自己把进程搞崩，一行结果都没打出来。
+    static char page[0x4000];
+    for (int i = 0; i < g_region_n; i++) {
+        uint64_t rs = g_region[i].start, re = g_region[i].end;
+        if (only_hi && (re <= only_lo || rs >= only_hi)) continue;   // 只扫指定段
+        if (only_hi) { if (rs < only_lo) rs = only_lo; if (re > only_hi) re = only_hi; }
+        for (uint64_t a = rs; a < re; a += 0x4000) {
+            uint64_t n = (a + 0x4000 <= re) ? 0x4000 : (re - a);
+            mach_vm_size_t got = 0;
+            if (mach_vm_read_overwrite(mach_task_self(), (vm_address_t)a,
+                                       (mach_vm_size_t)n, (vm_address_t)page,
+                                       &got) != KERN_SUCCESS || got != n)
+                continue;                       // 整页读不出：跳过，不当成数据
+            for (uint64_t k = 0; k + 8 <= n; k += 8) {
+                uint64_t v;
+                memcpy(&v, page + k, 8);
+                scanned++;
+                // 只认真实用户态指针：宿主 mmap(NULL) 落在 4GB 到 32GB 这一带
+                // （本进程实测 0x102xxxxxx），且 8 个字节不能全是可打印 ASCII——
+                // 后者会把 ELF 里的字符串（"/lib/ld-linux-aarch64.so.1" 一类）
+                // 当成指针，实测 58 万处命中几乎全是这种噪声。
+                if (v < 0x100000000ULL || v >= 0x800000000ULL) continue;
+                {
+                    int printable = 1;
+                    for (int q = 0; q < 8; q++) {
+                        char c = (char)(v >> (q * 8));
+                        if (c < 0x20 || c > 0x7e) { printable = 0; break; }
+                    }
+                    if (printable) continue;
+                }
+                if (region_covers(v, v + 8)) continue;
+                hits++;
+                int slot = -1;
+                for (int q = 0; q < ntop; q++) if (top[q].v == v) { slot = q; break; }
+                if (slot >= 0) { top[slot].cnt++; continue; }
+                if (ntop < 64) { top[ntop].v = v; top[ntop].cnt = 1; top[ntop].at = a + k; ntop++; }
+            }
+        }
+    }
+    fprintf(stderr, "[mlc][探针] %s：扫 %ld 个 8 字节字，未登记指针命中 %ld 处，%d 个不同值\n",
+            tag, scanned, hits, ntop);
+    for (int k = 0; k < ntop; k++) {
+        fprintf(stderr, "[mlc][探针]   0x%llx 被引用 %d 次，首见于 0x%llx\n",
+                (unsigned long long)top[k].v, top[k].cnt,
+                (unsigned long long)top[k].at);
+        // 顺着这个指针读 48 字节：能读出东西说明客户机真的在用它，
+        // 读出的内容直接说明它指向什么（引擎自己的堆？宿主 libSystem？）。
+        static char probe[48];
+        mach_vm_size_t pg = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), (vm_address_t)top[k].v,
+                                   sizeof(probe), (vm_address_t)probe, &pg)
+            == KERN_SUCCESS && pg == sizeof(probe))
+            fprintf(stderr, "[mlc][探针]      *0x%llx = %s\n",
+                    (unsigned long long)top[k].v,
+                    /* 打成十六进制，避免把指针内容当字符串打印出事 */
+                    ({
+                        static char hex[160];
+                        for (int q = 0; q < 48; q++)
+                            snprintf(hex + q * 3, 4, "%02x ", (unsigned char)probe[q]);
+                        hex;
+                    }));
+    }
+    fflush(NULL);
+}
+
+static void mlc_dump_regions(const char *tag) {
+    const char *dd = getenv("MLC_DUMP_DIR");
+    // 先把引擎自己登记的镜像 dump 一遍
+    for (int i = 0; i < g_nimg; i++) {
+        image_t *m = &g_img[i];
+        Elf64_Ehdr *eh = (Elf64_Ehdr *)m->img;
+        if (!eh || memcmp(eh->e_ident, "\177ELF", 4) != 0) continue;
+        Elf64_Phdr *ph = (Elf64_Phdr *)(m->img + eh->e_phoff);
+        for (int k = 0; k < eh->e_phnum; k++) {
+            if (ph[k].p_type != PT_LOAD) continue;
+            if (!(ph[k].p_flags & 1)) continue;          // 只要可执行段
+            uint64_t lo = ph[k].p_vaddr, hi = lo + ph[k].p_filesz;
+            // 元数据节的文件区间：从 0x200 扫到可执行段末，覆盖
+            // .gnu.hash/.dynsym/.dynstr/.gnu.version*/.rela.*
+            uint64_t s = lo + 0x200, e = hi;
+            if (s >= e) continue;
+            char op[512];
+            const char *bn = strrchr(m->name, '/');
+            bn = bn ? bn + 1 : m->name;
+            snprintf(op, sizeof(op), "%s/%s.bin", dd, bn);
+            FILE *fo = fopen(op, "wb");
+            if (!fo) continue;
+            fwrite((void *)(uintptr_t)(m->mem + s), 1, (size_t)(e - s), fo);
+            fclose(fo);
+            fprintf(stderr, "[mlc][转储] %s 元数据 0x%llx-0x%llx -> %s\n",
+                    bn, (unsigned long long)s, (unsigned long long)e, op);
+        }
+    }
+    // 再扫区域表：libc 一类库是 ld.so 自己 mmap 进来的，引擎没有登记成
+    // 镜像，只在区域表里。全量 dump，事后再按 ELF 头定位各个库的表。
+    // 之所以不能只 dump 以 ELF 开头的区间：客户机 munmap 掉预留区头部
+    // 之后，region_add 的相邻合并会把区间起点并回到预留区基址，
+    // 于是"区间起点"并不等于 ELF 头，按 \7fELF 过滤会漏掉真正的库。
+    for (int i = 0; i < g_region_n; i++) {
+        uint64_t rs = g_region[i].start, re = g_region[i].end;
+        if (re <= rs) continue;
+        char op[512];
+        snprintf(op, sizeof(op), "%s/reg%02d.bin", dd, i);
+        FILE *fo = fopen(op, "wb");
+        if (!fo) continue;
+        // K2 排查：区间里可能有页根本不可读。宿主页 16K 而客户机页 4K，
+        // mprotect 按宿主页对齐时会把多出来的 12K 一并设成 PROT_NONE——
+        // 客户机的 .dynsym 一类元数据若恰好落在这 12K 里，符号查找就会
+        // 「表在但读不到」。先用 mach_vm_read_overwrite 逐页问可读性
+        // （它不会因读不可读内存而触发 SIGSEGV），读得出的写原文，
+        // 读不出的补 0xFF，并把不可读范围打到日志。
+        // 之所以不能直接 fwrite 整段：读到不可读页会 SIGSEGV，
+        // 而信号处理器入口的 SIG_DFL 兜底会让进程当场死掉，
+        // 转储就停在半路。
+        uint64_t badstart = 0, badend = 0, badcnt = 0;
+        for (uint64_t a = rs; a < re; a += 0x4000) {
+            uint64_t n = (a + 0x4000 <= re) ? 0x4000 : (re - a);
+            static char tmp[0x4000];
+            memset(tmp, 0xFF, (size_t)n);
+            mach_vm_size_t got = 0;
+            kern_return_t kr = mach_vm_read_overwrite(
+                mach_task_self(), (vm_address_t)a, (mach_vm_size_t)n,
+                (vm_address_t)tmp, &got);
+            if (kr == KERN_SUCCESS && got == n) {
+                fwrite(tmp, 1, (size_t)n, fo);
+                continue;
+            }
+            // 整页读不进来：逐字问，能读的读，不能的保持 0xFF
+            if (!badstart) badstart = a;
+            badend = a + n;
+            badcnt++;
+            for (uint64_t k = 0; k < n; k++) {
+                mach_vm_size_t g1 = 0;
+                if (mach_vm_read_overwrite(mach_task_self(),
+                        (vm_address_t)(a + k), 1,
+                        (vm_address_t)(tmp + k), &g1) != KERN_SUCCESS)
+                    tmp[k] = (char)0xFF;
+            }
+            fwrite(tmp, 1, (size_t)n, fo);
+        }
+        fclose(fo);
+        if (badstart)
+            fprintf(stderr, "[mlc][转储] 区域 %d [0x%llx,0x%llx) -> %s，"
+                    "其中 %d 个 16K 页不可读，首末 0x%llx-0x%llx（已用 0xFF 补齐）\n",
+                    i, (unsigned long long)rs, (unsigned long long)re, op,
+                    (int)badcnt, (unsigned long long)badstart,
+                    (unsigned long long)badend);
+        else
+            fprintf(stderr, "[mlc][转储] 区域 %d [0x%llx,0x%llx) -> %s\n",
+                    i, (unsigned long long)rs, (unsigned long long)re, op);
+    }
+}
+
 static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
     uint64_t nr = regs[REG_X8];
     uint64_t a0 = regs[0], a1 = regs[1], a2 = regs[2], a3 = regs[3], a4 = regs[4], a5 = regs[5];
@@ -1393,6 +1681,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
             if (a2 > 32 && a2 <= GUEST_IO_MAX &&
                 memmem((const void *)(uintptr_t)a1, (size_t)a2, "symbol lookup error", 19))
                 mlc_dump_guest_backtrace(regs);
+            mlc_dump_sc_args("此刻（write 报错点）");
             ssize_t r = write(hfd, (const void *)a1, (size_t)a2);
             return r < 0 ? -errno : r;
         } else {
@@ -1412,6 +1701,7 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
                     if (memmem(p, (size_t)len, "symbol lookup error", 19) ||
                         memmem(p, (size_t)len, "undefined symbol:", 17))
                         mlc_dump_guest_backtrace(regs);
+                    mlc_dump_sc_args("此刻（writev 报错点）");
                 }
                 ssize_t r = write(hfd, (const void *)base, (size_t)len);
                 if (r < 0) return total ? total : -errno;
@@ -1820,102 +2110,23 @@ static int64_t mlc_syscall_handler_impl(uint64_t *regs) {
             // _dl_argv / __libc_single_threaded），说明坏的是查表机制而不是某个符号，
             // 而查表机制的数据全在这段里。比对结果直接回答"内存里的表有没有被改"。
         }
-                    const char *dd = getenv("MLC_DUMP_DIR");
-            if (dd) {
-                // 先把引擎自己登记的镜像 dump 一遍
-                for (int i = 0; i < g_nimg; i++) {
-                    image_t *m = &g_img[i];
-                    Elf64_Ehdr *eh = (Elf64_Ehdr *)m->img;
-                    if (!eh || memcmp(eh->e_ident, "\177ELF", 4) != 0) continue;
-                    Elf64_Phdr *ph = (Elf64_Phdr *)(m->img + eh->e_phoff);
-                    for (int k = 0; k < eh->e_phnum; k++) {
-                        if (ph[k].p_type != PT_LOAD) continue;
-                        if (!(ph[k].p_flags & 1)) continue;          // 只要可执行段
-                        uint64_t lo = ph[k].p_vaddr, hi = lo + ph[k].p_filesz;
-                        // 元数据节的文件区间：从 0x200 扫到可执行段末，覆盖
-                        // .gnu.hash/.dynsym/.dynstr/.gnu.version*/.rela.*
-                        uint64_t s = lo + 0x200, e = hi;
-                        if (s >= e) continue;
-                        char op[512];
-                        const char *bn = strrchr(m->name, '/');
-                        bn = bn ? bn + 1 : m->name;
-                        snprintf(op, sizeof(op), "%s/%s.bin", dd, bn);
-                        FILE *fo = fopen(op, "wb");
-                        if (!fo) continue;
-                        fwrite((void *)(uintptr_t)(m->mem + s), 1, (size_t)(e - s), fo);
-                        fclose(fo);
-                        fprintf(stderr, "[mlc][转储] %s 元数据 0x%llx-0x%llx -> %s\n",
-                                bn, (unsigned long long)s, (unsigned long long)e, op);
-                    }
-                }
-                // 再扫区域表：libc 一类库是 ld.so 自己 mmap 进来的，引擎没有登记成
-                // 镜像，只在区域表里。全量 dump，事后再按 ELF 头定位各个库的表。
-                // 之所以不能只 dump 以 ELF 开头的区间：客户机 munmap 掉预留区头部
-                // 之后，region_add 的相邻合并会把区间起点并回到预留区基址，
-                // 于是"区间起点"并不等于 ELF 头，按 \7fELF 过滤会漏掉真正的库。
-                for (int i = 0; i < g_region_n; i++) {
-                    uint64_t rs = g_region[i].start, re = g_region[i].end;
-                    if (re <= rs) continue;
-                    char op[512];
-                    snprintf(op, sizeof(op), "%s/reg%02d.bin", dd, i);
-                    FILE *fo = fopen(op, "wb");
-                    if (!fo) continue;
-                    // K2 排查：区间里可能有页根本不可读。宿主页 16K 而客户机页 4K，
-                    // mprotect 按宿主页对齐时会把多出来的 12K 一并设成 PROT_NONE——
-                    // 客户机的 .dynsym 一类元数据若恰好落在这 12K 里，符号查找就会
-                    // 「表在但读不到」。先用 mach_vm_read_overwrite 逐页问可读性
-                    // （它不会因读不可读内存而触发 SIGSEGV），读得出的写原文，
-                    // 读不出的补 0xFF，并把不可读范围打到日志。
-                    // 之所以不能直接 fwrite 整段：读到不可读页会 SIGSEGV，
-                    // 而信号处理器入口的 SIG_DFL 兜底会让进程当场死掉，
-                    // 转储就停在半路。
-                    uint64_t badstart = 0, badend = 0, badcnt = 0;
-                    for (uint64_t a = rs; a < re; a += 0x4000) {
-                        uint64_t n = (a + 0x4000 <= re) ? 0x4000 : (re - a);
-                        static char tmp[0x4000];
-                        memset(tmp, 0xFF, (size_t)n);
-                        mach_vm_size_t got = 0;
-                        kern_return_t kr = mach_vm_read_overwrite(
-                            mach_task_self(), (vm_address_t)a, (mach_vm_size_t)n,
-                            (vm_address_t)tmp, &got);
-                        if (kr == KERN_SUCCESS && got == n) {
-                            fwrite(tmp, 1, (size_t)n, fo);
-                            continue;
-                        }
-                        // 整页读不进来：逐字问，能读的读，不能的保持 0xFF
-                        if (!badstart) badstart = a;
-                        badend = a + n;
-                        badcnt++;
-                        for (uint64_t k = 0; k < n; k++) {
-                            mach_vm_size_t g1 = 0;
-                            if (mach_vm_read_overwrite(mach_task_self(),
-                                    (vm_address_t)(a + k), 1,
-                                    (vm_address_t)(tmp + k), &g1) != KERN_SUCCESS)
-                                tmp[k] = (char)0xFF;
-                        }
-                        fwrite(tmp, 1, (size_t)n, fo);
-                    }
-                    fclose(fo);
-                    if (badstart)
-                        fprintf(stderr, "[mlc][转储] 区域 %d [0x%llx,0x%llx) -> %s，"
-                                "其中 %d 个 16K 页不可读，首末 0x%llx-0x%llx（已用 0xFF 补齐）\n",
-                                i, (unsigned long long)rs, (unsigned long long)re, op,
-                                (int)badcnt, (unsigned long long)badstart,
-                                (unsigned long long)badend);
-                    else
-                        fprintf(stderr, "[mlc][转储] 区域 %d [0x%llx,0x%llx) -> %s\n",
-                                i, (unsigned long long)rs, (unsigned long long)re, op);
-                }
-            }
+        // K2 排查五轮：定点转储启用时跳过退出转储。两个时机写同一批文件名，
+        // 退出那次会把定点那次覆盖掉——而失败轮死得早、成功轮跑完了 perl，
+        // 覆盖之后两份文件根本不是同一个程序点，差分结论全废。
+        // 定点转储的目的就是"同一个系统调用序号"，所以它与退出转储互斥。
+        if (g_dump_at_sc <= 0) mlc_dump_regions("退出时");
+        mlc_probe_unreg_ptrs("退出时");
+
         // K2 排查：系统调用序列的前 SC_SEQ_MAX 个。放在 MLC_DEBUG 块外：
         // MLC_DEBUG 本身会改变 K2 的失败率，拿它当开关就分不清是打印的影响
         // 还是序列本身的关系。与成功轮对比，第一次分叉处即根因所在。
         if (g_sc_trace) {
             fprintf(stderr, "[mlc][诊断] 系统调用序列（%d 个）：", g_sc_seq_n);
             for (int k = 0; k < g_sc_seq_n; k++)
-                fprintf(stderr, "%s%d", k ? "," : "", g_sc_seq[k]);
+                fprintf(stderr, "%s%d", k ? "," : "", g_sc_seq[k].nr);
             fprintf(stderr, "\n");
         }
+        mlc_dump_sc_args("退出时");
         fflush(NULL);
         // CLONE_CHILD_CLEARTID：退出前把 child_tidptr 清成 0（Linux 内核语义）。
         // 只在与当初记下的值一致时才写，避免清掉别人后来写进去的东西。
@@ -2492,7 +2703,32 @@ static int64_t mlc_syscall_handler(uint64_t *regs) {
         const char *e = getenv("MLC_SC_TRACE");
         g_sc_trace = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
     }
-    if (g_sc_trace && g_sc_seq_n < SC_SEQ_MAX) g_sc_seq[g_sc_seq_n++] = (int)regs[REG_X8];
+    if (g_sc_args < 0) {
+        const char *e = getenv("MLC_SC_ARGS");
+        g_sc_args = (e && *e && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    if (g_sc_trace && g_sc_seq_n < SC_SEQ_MAX) {
+        g_sc_seq[g_sc_seq_n].nr = (int)regs[REG_X8];
+        g_sc_seq[g_sc_seq_n].ret = MLSC_RET_PENDING;
+        g_sc_seq[g_sc_seq_n].a0 = regs[REG_X0];
+        g_sc_seq[g_sc_seq_n].a1 = regs[1];
+        g_sc_seq[g_sc_seq_n].a2 = regs[2];
+        g_sc_seq_n++;
+    }
+    // K2 排查四轮：在第 N 个客户机系统调用处全量转储一次。退出时的转储对成功轮
+    // 来说已经跑完 perl，与失败轮不是同一个程序点，两份转储没法差分；钉在同一个
+    // 系统调用序号上，两侧才是同一点。失败轮在第 46 项（4 个 mprotect 之后）
+    // 与成功轮分道，所以取 46：此时成功轮正要发它自己的第 5 个 mprotect。
+    if (g_dump_at_sc < 0) {
+        const char *e = getenv("MLC_DUMP_AT_SC");
+        g_dump_at_sc = (e && *e) ? atoi(e) : 0;
+    }
+    if (g_dump_at_sc > 0 && (int)g_sc_total == g_dump_at_sc) {
+        fprintf(stderr, "[mlc][转储] 触发：第 %d 个系统调用处（此刻 nr=%llu）\n",
+                g_dump_at_sc, (unsigned long long)regs[REG_X8]);
+        mlc_dump_regions("定点");
+        mlc_probe_unreg_ptrs("定点");
+    }
     // 兼记有效客户机 TCB：msr TPIDR_EL0 写入点已由 mlc_tp_write_probe 记录，
     // 这里再兜一层——万一将来有别的路径设了线程指针（或写入点漏拦），
     // 顶替时手里仍有可用的值。判据与 TP_PLAUSIBLE_MIN 相同。
@@ -2544,6 +2780,13 @@ static int64_t mlc_syscall_handler(uint64_t *regs) {
         for (int k = 0; k < 20000; k++) acc += (uint64_t)k * 2654435761u;
     }
     int64_t r = mlc_syscall_handler_impl(regs);
+    // K2 排查五轮：把返回值补记到刚登记的那一条上。此前只记参数不记返回值，
+    // 于是「brk(0) 到底返回哪个地址」「mmap 到底成没成」全程不可见——
+    // 而这两项正是客户机堆与库落位的直接输入。返回值不同而参数相同，
+    // 是「序列逐项相同却结果不同」的唯一可能解释。
+    if (g_sc_trace && g_sc_seq_n > 0 &&
+        g_sc_seq[g_sc_seq_n - 1].ret == MLSC_RET_PENDING)
+        g_sc_seq[g_sc_seq_n - 1].ret = r;
     // K1 排查：regs[REG_TPIDR] 此刻就是蹦桌出口 msr tpidr_el0 将要写回的值。
     // 崩溃时把它与现场读到的 TPIDR_EL0 对比：相等说明翻野发生在最后一次系统调用
     // 之后的纯客户机代码里；不相等说明蹦桌的还原本身就漏了。
@@ -2897,9 +3140,24 @@ int main(int argc, char **argv) {
         }
     }
     // 3. brk 独立预留区（与镜像、蹦床、其他映射都不重叠）
-    uint8_t *brk_region = mmap(NULL, BRK_RESERVE, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (brk_region == MAP_FAILED) die("无法分配 brk 预留区");
+    // K2 排查三轮：MLC_BRK_ADDR 把它钉死。不钉它时每轮一个取值，
+    // 而客户机 TCB/TLS 与 glibc 早期 malloc 的 l_scope、l_versions 都在
+    // 这块堆上，位置本身就是符号查找的输入之一。
+    int brk_pinned = 0;
+    // K2 排查五轮：默认把 brk 贴在窗口末之后固定 4MB，而不是独立 mmap(NULL)。
+    // 实测依据见下方注释。显式给了 MLC_BRK_ADDR 时以它为准。
+    uint64_t brk_hint = 0;
+    {
+        const char *e = getenv("MLC_BRK_ADDR");
+        if (e && *e) {
+            unsigned long long v = strtoull(e, NULL, 0);
+            if (v >= 0x100000000ULL && (v & 0x3FFFULL) == 0) brk_hint = v;
+            else fprintf(stderr, "[mlc][警告] MLC_BRK_ADDR=0x%llx 不合要求（需 >=4GB 且 16K 对齐），忽略\n", v);
+        }
+    }
+    if (!brk_hint) brk_hint = (uint64_t)g_win_end + (4ULL << 20);
+    uint8_t *brk_region = mlc_map_at((void *)brk_hint, (size_t)BRK_RESERVE,
+                                     "brk 预留区", &brk_pinned);
     g_brk_start = (uint64_t)brk_region;
     g_brk_cur = g_brk_start;
     g_brk_region_end = (uint64_t)brk_region + BRK_RESERVE;
@@ -2911,9 +3169,10 @@ int main(int argc, char **argv) {
     //   2. 未提交部分被当成合法内存，野指针校验对它们放行。
     // brk 增长/收缩本身已经在 SYS_brk 里同步登记与摘除，这里只兜底登记已提交部分。
     region_add(g_brk_start, g_brk_cur);
-    fprintf(stderr, "[mlc] brk 预留区 0x%llx-0x%llx（%llu MB）\n",
+    fprintf(stderr, "[mlc] brk 预留区 0x%llx-0x%llx（%llu MB，%s）\n",
             (unsigned long long)g_brk_start, (unsigned long long)g_brk_region_end,
-            (unsigned long long)(BRK_RESERVE >> 20));
+            (unsigned long long)(BRK_RESERVE >> 20),
+            brk_pinned ? "已按 MLC_BRK_ADDR 钉死" : "由 mmap 自选");
     if (interp) fprintf(stderr, "[mlc] 控制权将交给 interp（入口 0x%llx）\n",
                         (unsigned long long)interp->entry);
 
@@ -2928,9 +3187,21 @@ int main(int argc, char **argv) {
     // 环境变量总量常有好几 KB，写出去就是 SIGSEGV（客户机看到的是"莫名崩了"）。
     #define GUEST_STACK_SLACK 65536
     size_t stack_size = 8 * 1024 * 1024;
-    uint8_t *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (stack == MAP_FAILED) die("无法分配客户机栈");
+    // K2 排查三轮：MLC_STK_ADDR 把客户机栈也钉死。它与 brk 的偏移恒定
+    // （实测 60 轮全部为栈等于 brk 加 0x27ef490），所以钉 brk 通常就够了；
+    // 但两者是两次独立 mmap，不能想当然，还是各自给一个探针。
+    int stk_pinned = 0;
+    uint64_t stk_hint = 0;
+    {
+        const char *e = getenv("MLC_STK_ADDR");
+        if (e && *e) {
+            unsigned long long v = strtoull(e, NULL, 0);
+            if (v >= 0x100000000ULL && (v & 0x3FFFULL) == 0) stk_hint = v;
+            else fprintf(stderr, "[mlc][警告] MLC_STK_ADDR=0x%llx 不合要求（需 >=4GB 且 16K 对齐），忽略\n", v);
+        }
+    }
+    if (!stk_hint) stk_hint = g_brk_region_end + (8ULL << 20);
+    uint8_t *stack = mlc_map_at((void *)stk_hint, stack_size, "客户机栈", &stk_pinned);
     region_add((uint64_t)stack, (uint64_t)stack + stack_size);   // M1：栈纳入可访问区域
     uint8_t *sp_top = stack + stack_size - GUEST_STACK_SLACK;
 
@@ -3072,9 +3343,10 @@ int main(int argc, char **argv) {
 
     // 跳转目标：有 interp 交给 ld.so（它自 relocation 后调主程序入口），否则直接进主程序
     uint64_t jump_target = interp ? interp->entry : main_im->entry;
-    fprintf(stderr, "[mlc] 客户机栈就绪 sp=0x%llx，跳转入口 0x%llx%s\n",
+    fprintf(stderr, "[mlc] 客户机栈就绪 sp=0x%llx，跳转入口 0x%llx%s（%s）\n",
             (unsigned long long)guest_sp, (unsigned long long)jump_target,
-            interp ? "（ld.so）" : "（主程序）");
+            interp ? "（ld.so）" : "（主程序）",
+            stk_pinned ? "栈已按 MLC_STK_ADDR 钉死" : "栈由 mmap 自选");
 
     // 7. 跳转到客户机入口（不再返回）
     // execve 会 longjmp 回循环开头重新加载，所以这里不能只是 unreachable——
